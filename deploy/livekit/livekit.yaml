@@ -1,0 +1,10 @@
+port: 62780
+bind_addresses:
+  - ""
+rtc:
+  use_external_ip: false
+  tcp_port: 62781
+  port_range_start: 62782
+  port_range_end: 62820
+keys:
+  devkey: secret

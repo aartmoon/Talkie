@@ -1,0 +1,37 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local env files
+.env
+.env.*
+!.env.prod.example
+
+# Logs / runtime
+*.log
+*.pid
+*.out
+
+# Go
+backend/bin/
+backend/coverage.out
+
+# Frontend (Vite / TS)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.npm-cache/
+frontend/coverage/
+frontend/*.tsbuildinfo
+
+# Uploads / generated media
+backend/uploads/
+uploads/
+
+# Build caches
+.cache/
+.tmp/
+

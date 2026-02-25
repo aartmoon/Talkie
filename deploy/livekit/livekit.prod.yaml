@@ -1,0 +1,9 @@
+port: 62780
+bind_addresses:
+  - ""
+rtc:
+  # Required for VM/public internet deployments
+  use_external_ip: true
+  tcp_port: 62781
+  port_range_start: 62782
+  port_range_end: 62820

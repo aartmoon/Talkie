@@ -1,0 +1,88 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: talkie-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - webt
+
+  livekit:
+    image: livekit/livekit-server:v1.8
+    container_name: talkie-livekit
+    restart: unless-stopped
+    command: >
+      --config /etc/livekit/livekit.prod.yaml
+      --node-ip ${LIVEKIT_NODE_IP}
+      --keys "${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}"
+    volumes:
+      - ./deploy/livekit:/etc/livekit:ro
+    networks:
+      - webt
+    ports:
+      - "62781:62781/tcp"
+      - "62782-62820:62782-62820/udp"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=webt"
+      - "traefik.http.routers.talkie-livekit.rule=Host(`rtc.call.moderium-ai.ru`)"
+      - "traefik.http.routers.talkie-livekit.entrypoints=websecure"
+      - "traefik.http.routers.talkie-livekit.tls.certresolver=${TRAEFIK_CERTRESOLVER}"
+      - "traefik.http.services.talkie-livekit.loadbalancer.server.port=62780"
+
+  backend:
+    image: ${TALKIE_BACKEND_IMAGE}
+    container_name: talkie-backend
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+      - JWT_SECRET=${JWT_SECRET}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      - MIGRATIONS_PATH=/app/migrations
+      - LIVEKIT_URL=wss://rtc.call.moderium-ai.ru
+    depends_on:
+      - postgres
+      - livekit
+    volumes:
+      - uploads_data:/app/uploads
+    networks:
+      - webt
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=webt"
+      - "traefik.http.routers.talkie-api.rule=Host(`call.moderium-ai.ru`) && (PathPrefix(`/api`) || PathPrefix(`/ws`) || PathPrefix(`/uploads`) || Path(`/healthz`))"
+      - "traefik.http.routers.talkie-api.entrypoints=websecure"
+      - "traefik.http.routers.talkie-api.tls.certresolver=${TRAEFIK_CERTRESOLVER}"
+      - "traefik.http.services.talkie-api.loadbalancer.server.port=8080"
+
+  frontend:
+    image: ${TALKIE_FRONTEND_IMAGE}
+    container_name: talkie-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    networks:
+      - webt
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=webt"
+      - "traefik.http.routers.talkie-web.rule=Host(`call.moderium-ai.ru`)"
+      - "traefik.http.routers.talkie-web.entrypoints=websecure"
+      - "traefik.http.routers.talkie-web.tls.certresolver=${TRAEFIK_CERTRESOLVER}"
+      - "traefik.http.services.talkie-web.loadbalancer.server.port=80"
+
+volumes:
+  postgres_data:
+  uploads_data:
+
+networks:
+  webt:
+    external: true

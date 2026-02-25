@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: talkie-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: talkie
+    ports:
+      - "62479:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d talkie"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  livekit:
+    image: livekit/livekit-server:v1.8
+    container_name: talkie-livekit
+    command: --config /etc/livekit.yaml --node-ip 127.0.0.1
+    volumes:
+      - ./deploy/livekit/livekit.yaml:/etc/livekit.yaml
+    ports:
+      - "62780:62780"
+      - "62781:62781"
+      - "62782-62820:62782-62820/udp"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: talkie-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    environment:
+      PORT: "61981"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/talkie?sslmode=disable
+      JWT_SECRET: change-me
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: secret
+      LIVEKIT_URL: ws://localhost:62780
+      ALLOWED_ORIGINS: http://localhost:61873
+      MIGRATIONS_PATH: /app/migrations
+      UPLOADS_DIR: /app/uploads
+    volumes:
+      - uploads_data:/app/uploads
+    ports:
+      - "61981:61981"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:61981
+    container_name: talkie-frontend
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "61873:80"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  uploads_data:
