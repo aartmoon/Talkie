@@ -18,7 +18,7 @@ type VideoTrackItem = {
 type CallParticipant = {
   id: string;
   username: string;
-  micEnabled: boolean;
+  micEnabled: boolean | null;
   hasCamera: boolean;
   hasScreen: boolean;
   watchingCamera: boolean;
@@ -84,10 +84,10 @@ function VideoTile({
             void ref.current?.requestFullscreen?.();
           }}
         >
-          Fullscreen
+          На весь экран
         </button>
       )}
-      <span>{item.username}{item.source === Track.Source.ScreenShare ? ' • Screen' : ''}</span>
+      <span>{item.username}{item.source === Track.Source.ScreenShare ? ' • Экран' : ''}</span>
     </div>
   );
 }
@@ -124,18 +124,21 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [connectingMedia, setConnectingMedia] = useState(false);
   const [inCall, setInCall] = useState(false);
+  const [activeCallRoomID, setActiveCallRoomID] = useState<string | null>(null);
   const [cameraEnabled, setCameraEnabled] = useState(false);
   const [micEnabled, setMicEnabled] = useState(false);
   const [screenEnabled, setScreenEnabled] = useState(false);
   const [deafened, setDeafened] = useState(false);
+  const [joinWithMicEnabled, setJoinWithMicEnabled] = useState<boolean>(
+    () => localStorage.getItem('talkie_join_with_mic') !== '0',
+  );
+  const [showMicSettings, setShowMicSettings] = useState(false);
   const [watchedVideoKeys, setWatchedVideoKeys] = useState<Record<string, boolean>>({});
   const [videoTracks, setVideoTracks] = useState<VideoTrackItem[]>([]);
   const [focusedTileKey, setFocusedTileKey] = useState<string | null>(null);
   const [activeSpeakerIDs, setActiveSpeakerIDs] = useState<string[]>([]);
   const [pendingImage, setPendingImage] = useState<File | null>(null);
   const [lightboxImageURL, setLightboxImageURL] = useState<string | null>(null);
-  const [voiceVolumes, setVoiceVolumes] = useState<Record<string, number>>({});
-  const [screenVolumes, setScreenVolumes] = useState<Record<string, number>>({});
   const [refreshTick, setRefreshTick] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -171,6 +174,14 @@ export function App() {
     () => videoTracks.filter((track) => track.key !== focusedTile?.key),
     [videoTracks, focusedTile],
   );
+  const activeCallRoom = useMemo(() => {
+    if (!activeCallRoomID) return null;
+    return [...rooms, ...dmRooms].find((room) => room.id === activeCallRoomID) || null;
+  }, [activeCallRoomID, rooms, dmRooms]);
+  const activeCallRoomKind = useMemo(() => {
+    if (!activeCallRoom) return null;
+    return dmRooms.some((room) => room.id === activeCallRoom.id) ? 'dm' : 'room';
+  }, [activeCallRoom, dmRooms]);
 
   function videoKey(participantID: string, source: Track.Source, sid?: string): string {
     return sid || `${participantID}-${source}`;
@@ -267,10 +278,7 @@ export function App() {
     let mounted = true;
     const refreshRoom = async () => {
       try {
-        const [latest, callUsers] = await Promise.all([
-          api.listMessages(token, selectedRoom.id, 50),
-          api.listCallParticipants(token, selectedRoom.id),
-        ]);
+        const latest = await api.listMessages(token, selectedRoom.id, 50);
         if (!mounted) return;
         setMessages((prev) => {
           if (prev.length === latest.length && prev[prev.length - 1]?.id === latest[latest.length - 1]?.id) {
@@ -282,7 +290,13 @@ export function App() {
           lastRoomMessageIDsRef.current[selectedRoom.id] = latest[latest.length - 1].id;
         }
         if (!inCall || callRoomIDRef.current !== selectedRoom.id) {
-          applyCallPresence(callUsers);
+          try {
+            const callUsers = await api.listCallParticipants(token, selectedRoom.id);
+            if (!mounted) return;
+            applyCallPresence(callUsers);
+          } catch {
+            // best effort
+          }
         }
       } catch {
         // best effort
@@ -334,6 +348,10 @@ export function App() {
   useEffect(() => {
     localStorage.setItem('talkie_sidebar_collapsed', sidebarCollapsed ? '1' : '0');
   }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem('talkie_join_with_mic', joinWithMicEnabled ? '1' : '0');
+  }, [joinWithMicEnabled]);
 
   useEffect(() => {
     return () => {
@@ -422,6 +440,7 @@ export function App() {
     selectedRoomIDRef.current = room.id;
     setMessages([]);
     setChatParticipants([]);
+    setCallParticipants([]);
     setPendingImage(null);
     setFocusedTileKey(null);
     setUnreadByRoom((prev) => ({ ...prev, [room.id]: 0 }));
@@ -431,16 +450,10 @@ export function App() {
 
     try {
       await api.joinRoom(token, room.id);
-      const [history, callUsers] = await Promise.all([
-        api.listMessages(token, room.id),
-        api.listCallParticipants(token, room.id),
-      ]);
+      const history = await api.listMessages(token, room.id);
       setMessages(history);
       if (history.length > 0) {
         lastRoomMessageIDsRef.current[room.id] = history[history.length - 1].id;
-      }
-      if (!inCall || callRoomIDRef.current !== room.id) {
-        applyCallPresence(callUsers);
       }
 
       const wsUrl = `${wsBaseUrl(api.apiBase)}/ws/rooms/${room.id}?token=${encodeURIComponent(token)}`;
@@ -489,6 +502,18 @@ export function App() {
       };
 
       wsRef.current = socket;
+
+      if (!inCall || callRoomIDRef.current !== room.id) {
+        void api.listCallParticipants(token, room.id)
+          .then((callUsers) => {
+            if (!inCall || callRoomIDRef.current !== room.id) {
+              applyCallPresence(callUsers);
+            }
+          })
+          .catch(() => {
+            // best effort
+          });
+      }
 
       const activeRoom = roomRef.current;
       if (inCall && activeRoom && callRoomIDRef.current === room.id) {
@@ -547,7 +572,7 @@ export function App() {
       users.map((u) => ({
         id: u.id,
         username: u.username,
-        micEnabled: false,
+        micEnabled: null,
         hasCamera: false,
         hasScreen: false,
         watchingCamera: false,
@@ -621,22 +646,6 @@ export function App() {
     } catch {
       // Best effort sound cue.
     }
-  }
-
-  function setParticipantVolume(participantID: string, source: 'voice' | 'screen', volume: number) {
-    if (source === 'voice') {
-      setVoiceVolumes((prev) => ({ ...prev, [participantID]: volume }));
-    } else {
-      setScreenVolumes((prev) => ({ ...prev, [participantID]: volume }));
-    }
-
-    audioElsRef.current.forEach((item) => {
-      if (item.participantID !== participantID) return;
-      const isScreenAudio = isScreenAudioSource(item.source);
-      if ((source === 'screen' && isScreenAudio) || (source === 'voice' && !isScreenAudio)) {
-        item.el.volume = volume;
-      }
-    });
   }
 
   function applyRemoteVideoSubscriptions(room: Room) {
@@ -756,8 +765,8 @@ export function App() {
           audioEl.muted = deafenedRef.current;
           const isScreenAudio = isScreenAudioSource(publication.source);
           audioEl.volume = isScreenAudio
-            ? (screenVolumes[participant.identity] ?? 1)
-            : (voiceVolumes[participant.identity] ?? 0.65);
+            ? 1
+            : 0.65;
           audioElsRef.current.set(audioKey, { participantID: participant.identity, source: publication.source, el: audioEl });
         }
         syncCallParticipants(room);
@@ -787,6 +796,7 @@ export function App() {
         notifyCallPresence('call_leave');
         watchedVideoKeysRef.current = {};
         callRoomIDRef.current = null;
+        setActiveCallRoomID(null);
         setInCall(false);
         setCameraEnabled(false);
         setMicEnabled(false);
@@ -815,17 +825,19 @@ export function App() {
       playJoinTone();
       notifyCallPresence('call_join');
       try {
-        await room.localParticipant.setMicrophoneEnabled(true);
-        setMicEnabled(true);
+        await room.localParticipant.setMicrophoneEnabled(joinWithMicEnabled);
+        setMicEnabled(joinWithMicEnabled);
       } catch {
         setMicEnabled(false);
       }
 
       roomRef.current = room;
       callRoomIDRef.current = selectedRoom.id;
+      setActiveCallRoomID(selectedRoom.id);
       syncCallParticipants(room);
       setCameraEnabled(false);
       setScreenEnabled(false);
+      setShowMicSettings(false);
       setInCall(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to connect call');
@@ -843,6 +855,7 @@ export function App() {
     watchedVideoKeysRef.current = {};
     notifyCallPresence('call_leave');
     callRoomIDRef.current = null;
+    setActiveCallRoomID(null);
 
     audioElsRef.current.forEach(({ el }) => el.remove());
     audioElsRef.current.clear();
@@ -854,6 +867,7 @@ export function App() {
     setMicEnabled(false);
     setDeafened(false);
     setScreenEnabled(false);
+    setShowMicSettings(false);
     setWatchedVideoKeys({});
     setActiveSpeakerIDs([]);
     setCallParticipants([]);
@@ -1112,7 +1126,7 @@ export function App() {
       <div className="auth-shell">
         <form className="auth-card" onSubmit={handleAuthSubmit}>
           <h1>Talkie</h1>
-          <p>Discord-style voice, video, and room chat MVP.</p>
+          <p>Голосовые комнаты, видеозвонки и чат в стиле Discord.</p>
           <label>
             Email
             <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
@@ -1127,13 +1141,13 @@ export function App() {
             Password
             <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
           </label>
-          <button type="submit">{mode === 'login' ? 'Sign in' : 'Create account'}</button>
+          <button type="submit">{mode === 'login' ? 'Войти' : 'Создать аккаунт'}</button>
           <button
             type="button"
             className="ghost"
             onClick={() => setMode((prev) => (prev === 'login' ? 'register' : 'login'))}
           >
-            {mode === 'login' ? 'Need an account? Register' : 'Have an account? Login'}
+            {mode === 'login' ? 'Нет аккаунта? Зарегистрироваться' : 'Уже есть аккаунт? Войти'}
           </button>
           {error && <p className="error">{error}</p>}
         </form>
@@ -1148,14 +1162,14 @@ export function App() {
           {!sidebarCollapsed && (
             <div>
               <h2>Talkie</h2>
-              <small>Voice spaces</small>
+              <small>Голосовые комнаты</small>
             </div>
           )}
           <button
             className="sidebar-toggle"
             type="button"
             onClick={() => setSidebarCollapsed((prev) => !prev)}
-            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={sidebarCollapsed ? 'Развернуть боковую панель' : 'Свернуть боковую панель'}
           >
             {sidebarCollapsed ? '>>' : '<<'}
           </button>
@@ -1163,128 +1177,146 @@ export function App() {
 
         {!sidebarCollapsed ? (
           <>
-            <div className="sidebar-tabs">
-              <button className={sidebarTab === 'rooms' ? 'active' : ''} onClick={() => setSidebarTab('rooms')} type="button">
-                Rooms {hasUnreadRooms && <span className="red-dot" />}
-              </button>
-              <button className={sidebarTab === 'dms' ? 'active' : ''} onClick={() => setSidebarTab('dms')} type="button">
-                DMs {hasUnreadDMs && <span className="red-dot" />}
-              </button>
-              <button className={sidebarTab === 'friends' ? 'active' : ''} onClick={() => setSidebarTab('friends')} type="button">
-                Friends {hasFriendRequestBadge && <span className="red-dot" />}
-              </button>
-            </div>
+            <div className="sidebar-main">
+              <div className="sidebar-tabs">
+                <button className={sidebarTab === 'rooms' ? 'active' : ''} onClick={() => setSidebarTab('rooms')} type="button">
+                  Комнаты {hasUnreadRooms && <span className="red-dot" />}
+                </button>
+                <button className={sidebarTab === 'dms' ? 'active' : ''} onClick={() => setSidebarTab('dms')} type="button">
+                  ЛС {hasUnreadDMs && <span className="red-dot" />}
+                </button>
+                <button className={sidebarTab === 'friends' ? 'active' : ''} onClick={() => setSidebarTab('friends')} type="button">
+                  Друзья {hasFriendRequestBadge && <span className="red-dot" />}
+                </button>
+              </div>
+              {inCall && activeCallRoom && (
+                <button
+                  type="button"
+                  className="current-call-card"
+                  onClick={() => {
+                    setSidebarTab(activeCallRoomKind === 'dm' ? 'dms' : 'rooms');
+                    openRoom(activeCallRoom);
+                  }}
+                  title="Перейти в беседу звонка"
+                >
+                  <small>Сейчас в звонке</small>
+                  <strong>{`${activeCallRoomKind === 'dm' ? '@' : '#'} ${activeCallRoom.name}`}</strong>
+                </button>
+              )}
 
-            {sidebarTab === 'rooms' && (
-              <div className="rooms-panel">
-                <form onSubmit={createRoom} className="new-room-form create-room-form">
-                  <input
-                    placeholder="Create new room"
-                    value={newRoomName}
-                    onChange={(e) => setNewRoomName(e.target.value)}
-                  />
-                  <label className="private-toggle">
+              {sidebarTab === 'rooms' && (
+                <div className="rooms-panel">
+                  <form onSubmit={createRoom} className="new-room-form create-room-form">
                     <input
-                      type="checkbox"
-                      checked={newRoomPrivate}
-                      onChange={(e) => setNewRoomPrivate(e.target.checked)}
+                      placeholder="Новая комната"
+                      value={newRoomName}
+                      onChange={(e) => setNewRoomName(e.target.value)}
                     />
-                    Private
-                  </label>
-                  <button type="submit">Create</button>
-                </form>
+                    <label className="private-toggle">
+                      <input
+                        type="checkbox"
+                        checked={newRoomPrivate}
+                        onChange={(e) => setNewRoomPrivate(e.target.checked)}
+                      />
+                      Приватная
+                    </label>
+                    <button type="submit">Создать</button>
+                  </form>
 
+                  <ul className="room-list">
+                    {sortedRooms.map((room) => (
+                      <li key={room.id}>
+                        <button
+                          className={selectedRoom?.id === room.id ? 'active' : ''}
+                          onClick={() => openRoom(room)}
+                        >
+                          <span className="room-hash">#</span>
+                          <span className="room-name">{room.name}</span>
+                          {room.is_private && <span className="room-private-badge">приват</span>}
+                          {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {sidebarTab === 'dms' && (
                 <ul className="room-list">
-                  {sortedRooms.map((room) => (
+                  {dmRooms.map((room) => (
                     <li key={room.id}>
                       <button
                         className={selectedRoom?.id === room.id ? 'active' : ''}
                         onClick={() => openRoom(room)}
                       >
-                        <span className="room-hash">#</span> {room.name}
-                        {room.is_private && <span className="room-private-badge">private</span>}
+                        <span className="room-hash">@</span>
+                        <span className="room-name">{room.name}</span>
                         {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
                       </button>
                     </li>
                   ))}
                 </ul>
-              </div>
-            )}
+              )}
 
-            {sidebarTab === 'dms' && (
-              <ul className="room-list">
-                {dmRooms.map((room) => (
-                  <li key={room.id}>
-                    <button
-                      className={selectedRoom?.id === room.id ? 'active' : ''}
-                      onClick={() => openRoom(room)}
-                    >
-                      <span className="room-hash">@</span> {room.name}
-                      {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-
-            {sidebarTab === 'friends' && (
-              <div className="friends-panel">
-                <form onSubmit={handleUserSearch} className="new-room-form">
-                  <input
-                    placeholder="Find user by name/email"
-                    value={userSearchQuery}
-                    onChange={(e) => setUserSearchQuery(e.target.value)}
-                  />
-                  <button type="submit">Find</button>
-                </form>
-                <ul className="room-list">
-                  {userSearchResults.map((f) => (
-                    <li key={f.id}>
-                      <button
-                        onClick={() => addFriend(f.id)}
-                        type="button"
-                        disabled={Boolean(sentFriendRequests[f.id]) || friendsData.friends.some((x) => x.id === f.id)}
-                      >
-                        {friendsData.friends.some((x) => x.id === f.id)
-                          ? `Added: ${f.username}`
-                          : sentFriendRequests[f.id]
-                            ? `Requested: ${f.username}`
-                            : `+ ${f.username}`}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-                <div className="participants">
-                  <strong>Requests</strong>
-                  <ul className="participant-list">
-                    {friendsData.incoming.map((fr) => (
-                      <li key={fr.id}>
-                        <span className="participant-name">{fr.requester_username}</span>
-                        <button type="button" onClick={() => acceptFriend(fr.id)}>Accept</button>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-                <div className="participants">
-                  <strong>Friends</strong>
-                  <ul className="participant-list">
-                    {friendsData.friends.map((f) => (
+              {sidebarTab === 'friends' && (
+                <div className="friends-panel">
+                  <form onSubmit={handleUserSearch} className="new-room-form">
+                    <input
+                      placeholder="Найти пользователя по имени/email"
+                      value={userSearchQuery}
+                      onChange={(e) => setUserSearchQuery(e.target.value)}
+                    />
+                    <button type="submit">Найти</button>
+                  </form>
+                  <ul className="room-list">
+                    {userSearchResults.map((f) => (
                       <li key={f.id}>
-                        <span className="participant-name">{f.username}</span>
-                        <button type="button" onClick={() => openDMWith(f.id)}>Message</button>
+                        <button
+                          onClick={() => addFriend(f.id)}
+                          type="button"
+                          disabled={Boolean(sentFriendRequests[f.id]) || friendsData.friends.some((x) => x.id === f.id)}
+                        >
+                          {friendsData.friends.some((x) => x.id === f.id)
+                            ? `Уже в друзьях: ${f.username}`
+                            : sentFriendRequests[f.id]
+                              ? `Запрос отправлен: ${f.username}`
+                              : `+ ${f.username}`}
+                        </button>
                       </li>
                     ))}
                   </ul>
+                  <div className="participants">
+                    <strong>Заявки</strong>
+                    <ul className="participant-list">
+                      {friendsData.incoming.map((fr) => (
+                        <li key={fr.id}>
+                          <span className="participant-name">{fr.requester_username}</span>
+                          <button type="button" onClick={() => acceptFriend(fr.id)}>Принять</button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="participants">
+                    <strong>Друзья</strong>
+                    <ul className="participant-list">
+                      {friendsData.friends.map((f) => (
+                        <li key={f.id}>
+                          <span className="participant-name">{f.username}</span>
+                          <button type="button" onClick={() => openDMWith(f.id)}>Написать</button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
 
             <div className="sidebar-user">
               <div>
                 <strong>{user.username}</strong>
                 <small>{user.email}</small>
               </div>
-              <button className="logout" onClick={logout}>Logout</button>
+              <button className="logout" onClick={logout}>Выйти</button>
             </div>
           </>
         ) : (
@@ -1293,7 +1325,7 @@ export function App() {
               className={`rail-tab ${sidebarTab === 'rooms' ? 'active' : ''}`}
               onClick={() => setSidebarTab('rooms')}
               type="button"
-              title="Rooms"
+              title="Комнаты"
             >
               R
               {hasUnreadRooms && <span className="red-dot" />}
@@ -1302,7 +1334,7 @@ export function App() {
               className={`rail-tab ${sidebarTab === 'dms' ? 'active' : ''}`}
               onClick={() => setSidebarTab('dms')}
               type="button"
-              title="DMs"
+              title="Личные сообщения"
             >
               D
               {hasUnreadDMs && <span className="red-dot" />}
@@ -1311,7 +1343,7 @@ export function App() {
               className={`rail-tab ${sidebarTab === 'friends' ? 'active' : ''}`}
               onClick={() => setSidebarTab('friends')}
               type="button"
-              title="Friends"
+              title="Друзья"
             >
               F
               {hasFriendRequestBadge && <span className="red-dot" />}
@@ -1322,42 +1354,63 @@ export function App() {
 
       <main className="content">
         {!selectedRoom ? (
-          <section className="placeholder">Select or create a room.</section>
+          <section className="placeholder">Выберите комнату слева или создайте новую.</section>
         ) : (
           <>
             <section className="media-panel">
               <div className="media-header">
                 <div className="media-title">
                   <h3>{selectedRoom.name}</h3>
-                  <small>{inCall ? 'Connected to voice channel' : 'Room call + chat'}</small>
-                </div>
-                <div className="call-controls">
-                  {!inCall ? (
-                    <button className="big-join" onClick={joinCall} disabled={connectingMedia}>
-                      {connectingMedia ? 'Joining...' : 'Join call'}
-                    </button>
-                  ) : (
-                    <>
-                      <button className={micEnabled ? '' : 'control-off'} onClick={toggleMic} disabled={deafened}>
-                        {micEnabled ? 'Mic on' : 'Mic off'}
-                      </button>
-                      <button className={cameraEnabled ? '' : 'control-off'} onClick={toggleCamera}>
-                        {cameraEnabled ? 'Cam on' : 'Cam off'}
-                      </button>
-                      <button className={screenEnabled ? '' : 'control-off'} onClick={toggleScreenShare}>
-                        {screenEnabled ? 'Screen on' : 'Share screen'}
-                      </button>
-                      <button className={deafened ? 'control-off' : ''} onClick={toggleDeafen}>
-                        {deafened ? 'Deafened' : 'Deafen'}
-                      </button>
-                      <button className="danger" onClick={leaveCall}>Leave</button>
-                    </>
-                  )}
+                  <small>{inCall ? 'Подключено к голосовому каналу' : 'Звонок и чат комнаты'}</small>
                 </div>
               </div>
 
+              <div className="call-roster">
+                <strong>В звонке ({callParticipants.length})</strong>
+                {callParticipants.length === 0 ? (
+                  <div className="participant-empty">Пока никого в звонке</div>
+                ) : (
+                  <ul className="call-roster-list">
+                    {callParticipants.map((p) => (
+                      <li key={p.id} className={activeSpeakerIDs.includes(p.id) ? 'is-speaking' : ''}>
+                        <span className="avatar-dot" />
+                        <button
+                          type="button"
+                          className="msg-user-btn participant-name"
+                          onClick={() => openMiniProfile(p.id, p.username)}
+                        >
+                          {p.username}
+                        </button>
+                        <span className={`mic-badge ${p.micEnabled === null ? 'unknown' : (p.micEnabled ? '' : 'off')}`}>
+                          {p.micEnabled === null ? 'нет данных' : (p.micEnabled ? 'мик' : 'выкл')}
+                        </span>
+                        {activeSpeakerIDs.includes(p.id) && <em className="speaking-badge">говорит</em>}
+                        {p.id !== roomRef.current?.localParticipant.identity && p.hasCamera && (
+                          <button
+                            className={`stream-watch-btn ${p.watchingCamera ? '' : 'control-off'}`}
+                            onClick={() => toggleRemoteVideo(p.id, Track.Source.Camera)}
+                            type="button"
+                          >
+                            {p.watchingCamera ? 'Камера: вкл' : 'Камера: выкл'}
+                          </button>
+                        )}
+                        {p.id !== roomRef.current?.localParticipant.identity && p.hasScreen && (
+                          <button
+                            className={`stream-watch-btn ${p.watchingScreen ? '' : 'control-off'}`}
+                            onClick={() => toggleRemoteVideo(p.id, Track.Source.ScreenShare)}
+                            type="button"
+                          >
+                            {p.watchingScreen ? 'Экран: вкл' : 'Экран: выкл'}
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+
               {!inCall ? (
-                <div className="empty-video">Join the call to start audio/video.</div>
+                <div className="empty-video">Войдите в звонок, чтобы включить аудио и видео.</div>
               ) : (
                 <>
                   {focusedTile && (
@@ -1383,10 +1436,63 @@ export function App() {
                 </>
               )}
 
+              <div className="voice-dock">
+                {!inCall ? (
+                  <>
+                    <button className="big-join" onClick={joinCall} disabled={connectingMedia}>
+                      {connectingMedia ? 'Подключение...' : 'Подключиться к звонку'}
+                    </button>
+                    <button
+                      className={`dock-btn ${showMicSettings ? '' : 'control-off'}`}
+                      type="button"
+                      onClick={() => setShowMicSettings((prev) => !prev)}
+                    >
+                      Микрофон
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button className={`dock-btn ${micEnabled ? '' : 'control-off'}`} onClick={toggleMic} disabled={deafened}>
+                      {micEnabled ? 'Мик вкл' : 'Мик выкл'}
+                    </button>
+                    <button
+                      className={`dock-btn ${showMicSettings ? '' : 'control-off'}`}
+                      type="button"
+                      onClick={() => setShowMicSettings((prev) => !prev)}
+                    >
+                      Настройки микрофона
+                    </button>
+                    <button className={`dock-btn ${cameraEnabled ? '' : 'control-off'}`} onClick={toggleCamera}>
+                      {cameraEnabled ? 'Камера вкл' : 'Камера выкл'}
+                    </button>
+                    <button className={`dock-btn ${screenEnabled ? '' : 'control-off'}`} onClick={toggleScreenShare}>
+                      {screenEnabled ? 'Экран вкл' : 'Экран'}
+                    </button>
+                    <button className={`dock-btn ${deafened ? 'control-off' : ''}`} onClick={toggleDeafen}>
+                      {deafened ? 'Заглушен' : 'Заглушить'}
+                    </button>
+                    <button className="danger" onClick={leaveCall}>Отключиться</button>
+                  </>
+                )}
+              </div>
+              {showMicSettings && (
+                <div className="mic-settings-popover">
+                  <label className="mic-setting-row">
+                    <input
+                      type="checkbox"
+                      checked={joinWithMicEnabled}
+                      onChange={(e) => setJoinWithMicEnabled(e.target.checked)}
+                    />
+                    Входить в звонок с включенным микрофоном
+                  </label>
+                </div>
+              )}
+
             </section>
 
             <div className="bottom-row">
               <section className="chat-panel">
+                <div className="panel-heading">Чат комнаты</div>
                 <div className="messages" ref={messagesRef}>
                   {messages.map((m) => (
                     <p key={m.id} className={m.message_type === 'image' ? 'image-message' : ''}>
@@ -1394,7 +1500,7 @@ export function App() {
                         type="button"
                         className="msg-user-btn msg-user-top"
                         onClick={() => openMiniProfile(m.user_id, m.username)}
-                        title={m.user_id === user.id ? 'You' : 'Profile'}
+                        title={m.user_id === user.id ? 'Вы' : 'Профиль'}
                       >
                         {m.username}
                       </button>
@@ -1405,7 +1511,7 @@ export function App() {
                         <img
                           className="chat-image"
                           src={mediaUrl(api.apiBase, m.media_url)}
-                          alt={m.content || 'image'}
+                          alt={m.content || 'изображение'}
                           onClick={() => setLightboxImageURL(mediaUrl(api.apiBase, m.media_url))}
                           onLoad={() => {
                             const el = messagesRef.current;
@@ -1418,7 +1524,7 @@ export function App() {
                 </div>
 
                 <form onSubmit={sendChatMessage} className="chat-form">
-                  <label className="attach-btn" title="Attach image">
+                  <label className="attach-btn" title="Прикрепить изображение">
                     +
                     <input
                       type="file"
@@ -1429,24 +1535,24 @@ export function App() {
                   <input
                     value={chatInput}
                     onChange={(e) => setChatInput(e.target.value)}
-                    placeholder={pendingImage ? 'Add image caption (optional)' : 'Type a message'}
+                    placeholder={pendingImage ? 'Подпись к изображению (необязательно)' : 'Напишите сообщение'}
                   />
-                  <button type="submit">{pendingImage ? 'Send image' : 'Send'}</button>
+                  <button type="submit">{pendingImage ? 'Отправить фото' : 'Отправить'}</button>
                 </form>
-                {pendingImage && <small className="pending-file">Image attached</small>}
+                {pendingImage && <small className="pending-file">Изображение прикреплено</small>}
               </section>
 
               <section className="members-panel">
                 {selectedRoom.is_private && (
                   <div className="participants invite-panel">
-                    <strong>Private invites</strong>
+                    <strong>Приватные приглашения</strong>
                     <form onSubmit={handleInviteSearch} className="invite-form">
                       <input
-                        placeholder="Find user by name/email"
+                        placeholder="Найти пользователя по имени/email"
                         value={inviteQuery}
                         onChange={(e) => setInviteQuery(e.target.value)}
                       />
-                      <button type="submit">Find</button>
+                      <button type="submit">Найти</button>
                     </form>
                     {inviteResults.length > 0 && (
                       <ul className="participant-list">
@@ -1454,7 +1560,7 @@ export function App() {
                           <li key={candidate.id}>
                             <span className="participant-name">{candidate.username}</span>
                             <button type="button" onClick={() => inviteUserToRoom(candidate.id)}>
-                              Invite
+                              Пригласить
                             </button>
                           </li>
                         ))}
@@ -1463,9 +1569,9 @@ export function App() {
                   </div>
                 )}
                 <div className="participants">
-                  <strong>In chat</strong>
+                  <strong>В чате</strong>
                   {chatParticipants.length === 0 ? (
-                    <div className="participant-empty">No one connected to chat yet</div>
+                    <div className="participant-empty">Пока никого в чате</div>
                   ) : (
                     <ul className="participant-list">
                       {chatParticipants.map((p) => (
@@ -1474,78 +1580,6 @@ export function App() {
                           <button type="button" className="msg-user-btn" onClick={() => openMiniProfile(p.id, p.username)}>
                             {p.username}
                           </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-
-                <div className="participants">
-                  <strong>In call</strong>
-                  {callParticipants.length === 0 ? (
-                    <div className="participant-empty">No one in call</div>
-                  ) : (
-                    <ul className="participant-list">
-                      {callParticipants.map((p) => (
-                        <li key={p.id} className={activeSpeakerIDs.includes(p.id) ? 'is-speaking' : ''}>
-                          <span className="avatar-dot" />
-                          <button
-                            type="button"
-                            className="msg-user-btn participant-name"
-                            onClick={() => openMiniProfile(p.id, p.username)}
-                          >
-                            {p.username}
-                          </button>
-                          <span className={`mic-badge ${p.micEnabled ? '' : 'off'}`}>{p.micEnabled ? 'mic' : 'muted'}</span>
-                          {activeSpeakerIDs.includes(p.id) && <em className="speaking-badge">speaking</em>}
-                          {p.id !== roomRef.current?.localParticipant.identity && p.hasCamera && (
-                            <button
-                              className={`stream-watch-btn ${p.watchingCamera ? '' : 'control-off'}`}
-                              onClick={() => toggleRemoteVideo(p.id, Track.Source.Camera)}
-                              type="button"
-                            >
-                              {p.watchingCamera ? 'Hide cam' : 'Watch cam'}
-                            </button>
-                          )}
-                          {p.id !== roomRef.current?.localParticipant.identity && p.hasScreen && (
-                            <button
-                              className={`stream-watch-btn ${p.watchingScreen ? '' : 'control-off'}`}
-                              onClick={() => toggleRemoteVideo(p.id, Track.Source.ScreenShare)}
-                              type="button"
-                            >
-                              {p.watchingScreen ? 'Hide screen' : 'Watch screen'}
-                            </button>
-                          )}
-                          {p.id !== roomRef.current?.localParticipant.identity && (
-                            <label className="volume-control">
-                              <span>voice</span>
-                              <input
-                                className="volume-slider"
-                                type="range"
-                                min={0}
-                                max={1}
-                                step={0.05}
-                                value={voiceVolumes[p.id] ?? 0.65}
-                                onChange={(e) => setParticipantVolume(p.id, 'voice', Number(e.target.value))}
-                                title="Voice volume"
-                              />
-                            </label>
-                          )}
-                          {p.id !== roomRef.current?.localParticipant.identity && (
-                            <label className="volume-control">
-                              <span>screen</span>
-                              <input
-                                className="volume-slider"
-                                type="range"
-                                min={0}
-                                max={1}
-                                step={0.05}
-                                value={screenVolumes[p.id] ?? 1}
-                                onChange={(e) => setParticipantVolume(p.id, 'screen', Number(e.target.value))}
-                                title="Screen audio volume"
-                              />
-                            </label>
-                          )}
                         </li>
                       ))}
                     </ul>
@@ -1562,11 +1596,11 @@ export function App() {
               <h4>{miniProfile.username}</h4>
               <small>{miniProfile.email || miniProfile.id}</small>
               {miniProfile.id === user.id ? (
-                <button type="button" disabled>You</button>
+                <button type="button" disabled>Вы</button>
               ) : friendIDs.has(miniProfile.id) ? (
-                <button type="button" disabled>Added</button>
+                <button type="button" disabled>Уже в друзьях</button>
               ) : sentFriendRequests[miniProfile.id] ? (
-                <button type="button" disabled>Requested</button>
+                <button type="button" disabled>Запрос отправлен</button>
               ) : (
                 <button
                   type="button"
@@ -1574,7 +1608,7 @@ export function App() {
                     void addFriend(miniProfile.id);
                   }}
                 >
-                  Add friend
+                  Добавить в друзья
                 </button>
               )}
             </div>
@@ -1589,7 +1623,7 @@ export function App() {
           >
             <img
               src={lightboxImageURL}
-              alt="Full-size attachment"
+              alt="Вложение в полном размере"
               onClick={(e) => e.stopPropagation()}
             />
           </div>

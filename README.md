@@ -90,13 +90,16 @@ cp .env.prod.example .env.prod
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
 ```
 
+```bash
 docker buildx build \
 --platform linux/amd64 \
 -t artshar/talkie-frontend:1.0.0 \
 --build-arg VITE_API_BASE_URL=https://call.moderium-ai.ru \
 --push .
+```
 
-
+```bash
 docker compose --env-file .env.prod -f docker-compose.prod.yml down
 docker compose --env-file .env.prod -f docker-compose.prod.yml pull
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
+```

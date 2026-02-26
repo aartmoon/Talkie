@@ -1,6 +1,8 @@
 :root {
   color-scheme: dark;
   font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif;
+  --sidebar-width: 320px;
+  --sidebar-collapsed-width: 82px;
   --bg-0: #14161d;
   --bg-1: #1a1d27;
   --bg-2: #202432;
@@ -18,19 +20,26 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
   margin: 0;
-  min-height: 100vh;
+  min-height: 100%;
   color: var(--text-0);
   background:
     radial-gradient(1200px 600px at 100% -10%, #27304a 0%, transparent 60%),
     linear-gradient(160deg, #10131a 0%, #131723 100%);
+  overflow: auto;
 }
 
 .auth-shell {
   display: grid;
   place-items: center;
-  min-height: 100vh;
+  min-height: 100%;
   padding: 16px;
 }
 
@@ -80,19 +89,25 @@ button.ghost {
   color: var(--text-0);
 }
 
+.control-off {
+  background: #3a4054;
+}
+
 button.danger {
   background: var(--danger);
 }
 
 .app-shell {
   display: grid;
-  grid-template-columns: 340px 1fr;
-  min-height: 100vh;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  min-height: 100dvh;
+  height: 100%;
   background: linear-gradient(180deg, #151925 0%, #10131a 100%);
+  overflow: hidden;
 }
 
 .app-shell.sidebar-collapsed {
-  grid-template-columns: 84px 1fr;
+  grid-template-columns: var(--sidebar-collapsed-width) minmax(0, 1fr);
 }
 
 .sidebar {
@@ -100,10 +115,13 @@ button.danger {
   border-right: 1px solid var(--border);
   padding: 14px;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 12px;
-  min-height: 100vh;
-  overflow: hidden;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
 }
 
 .sidebar.collapsed {
@@ -152,11 +170,22 @@ button.danger {
   gap: 8px;
 }
 
+.sidebar-main {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+}
+
 .create-room-form {
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .create-room-form input {
+  flex: 1 1 100%;
+  min-width: 0;
   min-height: 30px;
   font-size: 12px;
   padding: 6px 8px;
@@ -205,9 +234,36 @@ button.danger {
   background: var(--accent);
 }
 
+.current-call-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #171e2d;
+  padding: 8px 10px;
+  display: grid;
+  gap: 4px;
+  text-align: left;
+  width: 100%;
+}
+
+.current-call-card small {
+  color: var(--text-1);
+  font-size: 11px;
+}
+
+.current-call-card strong {
+  font-size: 13px;
+  color: #e8eeff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .friends-panel {
   display: grid;
   gap: 10px;
+  min-height: 0;
+  overflow: auto;
+  align-content: start;
 }
 
 .room-list {
@@ -218,10 +274,16 @@ button.danger {
   gap: 6px;
   align-content: start;
   overflow: auto;
+  min-height: 0;
+}
+
+.room-list li {
+  min-width: 0;
 }
 
 .room-list button {
   width: 100%;
+  min-width: 0;
   text-align: left;
   background: #1f2534;
   color: #dde5ff;
@@ -230,10 +292,19 @@ button.danger {
   display: flex;
   align-items: center;
   gap: 6px;
+  overflow: hidden;
 }
 
 .room-list button.active {
   background: var(--accent);
+}
+
+.room-name {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .room-hash {
@@ -266,8 +337,10 @@ button.logout {
 .content {
   padding: 16px;
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
+  min-height: 0;
+  overflow: auto;
 }
 
 .placeholder,
@@ -288,6 +361,45 @@ button.logout {
 .members-panel {
   display: grid;
   gap: 10px;
+  align-content: start;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.call-roster {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: #181d2a;
+  display: grid;
+  gap: 8px;
+}
+
+.call-roster-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.call-roster-list li {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #20263a;
+  border-radius: 999px;
+  padding: 7px 10px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.call-roster-list li.is-speaking {
+  border-color: rgba(57, 208, 143, 0.6);
+  background: #203c32;
 }
 
 .media-header {
@@ -386,29 +498,49 @@ button.logout {
   text-align: center;
 }
 
-.call-controls {
+.voice-dock {
   display: flex;
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
-  justify-content: flex-end;
-  margin-left: auto;
+  justify-content: flex-start;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #151b2a;
+  padding: 10px;
 }
 
-.call-controls button {
+.dock-btn,
+.voice-dock .danger,
+.big-join {
   min-height: 38px;
   border-radius: 10px;
   padding: 0 12px;
   font-weight: 600;
 }
 
-.call-controls .big-join {
+.big-join {
   background: #2e9b62;
-  min-width: 130px;
+  min-width: 200px;
 }
 
-.call-controls .control-off {
+.dock-btn.control-off {
   background: #3a4054;
+}
+
+.mic-settings-popover {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #161d2f;
+  padding: 10px 12px;
+}
+
+.mic-setting-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #d6def8;
 }
 
 .participants {
@@ -416,6 +548,7 @@ button.logout {
   border-radius: 10px;
   padding: 10px;
   background: #181d2a;
+  overflow: hidden;
 }
 
 .participant-empty {
@@ -430,6 +563,8 @@ button.logout {
   padding: 0;
   display: grid;
   gap: 6px;
+  max-height: 280px;
+  overflow: auto;
 }
 
 .participant-list li {
@@ -471,6 +606,12 @@ button.logout {
   color: #ffb0b7;
   border-color: #b95a64;
   background: rgba(214, 88, 99, 0.16);
+}
+
+.mic-badge.unknown {
+  color: #c9d2ef;
+  border-color: #5a6588;
+  background: rgba(122, 140, 184, 0.14);
 }
 
 .speaking-badge {
@@ -518,15 +659,30 @@ button.logout {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px;
-  height: clamp(360px, 45vh, 560px);
+  min-height: 280px;
+  height: 100%;
   overflow: auto;
   background: #161b29;
 }
 
 .bottom-row {
   display: grid;
-  grid-template-columns: minmax(0, 3fr) minmax(290px, 1fr);
+  grid-template-columns: minmax(0, 2.8fr) minmax(300px, 1fr);
   gap: 14px;
+  min-height: min(56vh, 640px);
+}
+
+.chat-panel {
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  min-height: 0;
+}
+
+.panel-heading {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-1);
+  font-weight: 700;
 }
 
 .messages p {
@@ -614,7 +770,7 @@ button.logout {
 }
 
 .room-private-badge {
-  margin-left: auto;
+  margin-left: 0;
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.03em;
@@ -667,6 +823,7 @@ button.logout {
 
 .invite-form input {
   flex: 1;
+  min-width: 0;
 }
 
 .chat-form {
@@ -676,6 +833,7 @@ button.logout {
 
 .chat-form input {
   flex: 1;
+  min-width: 0;
 }
 
 .attach-btn {
@@ -742,25 +900,96 @@ button.logout {
 @media (max-width: 980px) {
   .app-shell {
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+    height: 100dvh;
   }
   .app-shell.sidebar-collapsed {
     grid-template-columns: 1fr;
   }
 
+  .sidebar {
+    height: auto;
+    min-height: 0;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    overflow-y: auto;
+  }
+
   .content {
     grid-template-columns: 1fr;
+    padding: 12px;
   }
 
   .bottom-row {
     grid-template-columns: 1fr;
+    min-height: 0;
   }
 
-  .call-controls {
-    margin-left: 0;
-    justify-content: flex-start;
+  .voice-dock {
+    justify-content: stretch;
   }
 
   .sidebar-user {
     margin-top: 0;
+  }
+
+  .participant-list {
+    max-height: 180px;
+  }
+
+  .messages {
+    min-height: 220px;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell {
+    height: auto;
+    min-height: 100dvh;
+  }
+
+  .sidebar {
+    max-height: none;
+  }
+
+  .sidebar-tabs {
+    grid-template-columns: 1fr;
+  }
+
+  .create-room-form {
+    flex-wrap: wrap;
+  }
+
+  .create-room-form input {
+    min-width: 100%;
+  }
+
+  .create-room-form button {
+    width: 100%;
+  }
+
+  .invite-form,
+  .new-room-form,
+  .chat-form {
+    flex-wrap: wrap;
+  }
+
+  .attach-btn {
+    width: 100%;
+  }
+
+  .chat-form button,
+  .invite-form button,
+  .new-room-form button {
+    width: 100%;
+  }
+
+  .voice-dock .dock-btn,
+  .voice-dock .danger {
+    flex: 1 1 calc(50% - 8px);
+  }
+
+  .voice-dock .big-join {
+    flex: 1 1 100%;
+    min-width: 100%;
   }
 }
