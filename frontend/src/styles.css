@@ -811,6 +811,11 @@ button.logout {
   background: var(--accent);
 }
 
+.rail-tab:disabled {
+  cursor: default;
+  opacity: 0.9;
+}
+
 .invite-panel {
   display: grid;
   gap: 8px;

@@ -3,7 +3,7 @@ import { Room, RoomEvent, Track } from 'livekit-client';
 import { APIError, api } from './lib/api';
 import type { Friend, FriendsResponse, Message, Participant, Room as AppRoom, User } from './lib/types';
 
-type AuthView = 'login' | 'register' | 'verify' | 'forgot';
+type AuthView = 'login' | 'register' | 'verify' | 'forgot' | 'reset';
 type SidebarTab = 'rooms' | 'dms' | 'friends';
 type MiniProfile = { id: string; username: string; email?: string };
 
@@ -121,6 +121,11 @@ export function App() {
   const [verificationTokenInput, setVerificationTokenInput] = useState('');
   const [isVerifyingEmail, setIsVerifyingEmail] = useState(false);
   const [authMessage, setAuthMessage] = useState<string | null>(null);
+  const [resetToken, setResetToken] = useState('');
+  const [newPasswordInput, setNewPasswordInput] = useState('');
+  const [newPasswordConfirmInput, setNewPasswordConfirmInput] = useState('');
+  const [friendInviteURL, setFriendInviteURL] = useState('');
+  const [creatingFriendInvite, setCreatingFriendInvite] = useState(false);
   const [roomActivityByID, setRoomActivityByID] = useState<Record<string, number>>({});
   const [selectedRoom, setSelectedRoom] = useState<AppRoom | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -259,6 +264,16 @@ export function App() {
   }, [token]);
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const resetTokenParam = params.get('token');
+    const isResetPath = window.location.pathname === '/reset-password';
+    if (isResetPath && resetTokenParam) {
+      setResetToken(resetTokenParam);
+      if (!token) setAuthView('reset');
+    }
+  }, [token]);
+
+  useEffect(() => {
     if (!token || !user || inviteJoinHandledRef.current) return;
     const params = new URLSearchParams(window.location.search);
     const inviteToken = params.get('invite');
@@ -290,6 +305,29 @@ export function App() {
     return () => {
       mounted = false;
     };
+  }, [token, user]);
+
+  useEffect(() => {
+    if (!token || !user) return;
+    const params = new URLSearchParams(window.location.search);
+    const friendInviteToken = params.get('friend_invite');
+    if (!friendInviteToken) return;
+
+    setError(null);
+    void api.acceptFriendInviteLink(token, friendInviteToken)
+      .then(async (friend) => {
+        setAuthMessage(`Вы добавили ${friend.username} в друзья.`);
+        await refreshSocial();
+        setSidebarTab('friends');
+      })
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : 'failed to accept friend invite');
+      })
+      .finally(() => {
+        params.delete('friend_invite');
+        const next = window.location.pathname + (params.toString() ? `?${params.toString()}` : '');
+        window.history.replaceState({}, '', next);
+      });
   }, [token, user]);
 
   useEffect(() => {
@@ -553,7 +591,37 @@ export function App() {
   function handleForgotPasswordSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    setAuthMessage('Сброс пароля пока не реализован. Напишите в поддержку.');
+    setAuthMessage(null);
+    void api.forgotPassword(email.trim().toLowerCase())
+      .then(() => setAuthMessage('Ссылка для сброса отправлена на email.'))
+      .catch((err) => setError(err instanceof Error ? err.message : 'failed to send reset link'));
+  }
+
+  function handleResetPasswordSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!resetToken.trim()) {
+      setError('Не найден токен сброса.');
+      return;
+    }
+    if (newPasswordInput.length < 6) {
+      setError('Пароль должен быть не короче 6 символов.');
+      return;
+    }
+    if (newPasswordInput !== newPasswordConfirmInput) {
+      setError('Пароли не совпадают.');
+      return;
+    }
+    setError(null);
+    setAuthMessage(null);
+    void api.resetPassword(resetToken.trim(), newPasswordInput)
+      .then(() => {
+        setAuthMessage('Пароль обновлен. Теперь войдите в аккаунт.');
+        setNewPasswordInput('');
+        setNewPasswordConfirmInput('');
+        setAuthView('login');
+        window.history.replaceState({}, '', '/');
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : 'failed to reset password'));
   }
 
   async function createRoom(e: React.FormEvent) {
@@ -1214,6 +1282,21 @@ export function App() {
     }
   }
 
+  async function generateFriendInviteLink() {
+    if (!token) return;
+    setCreatingFriendInvite(true);
+    setError(null);
+    try {
+      const result = await api.createFriendInviteLink(token);
+      setFriendInviteURL(result.invite_url);
+      await navigator.clipboard?.writeText(result.invite_url).catch(() => {});
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to create friend invite link');
+    } finally {
+      setCreatingFriendInvite(false);
+    }
+  }
+
   async function addFriend(userID: string) {
     if (!token) return;
     try {
@@ -1277,25 +1360,19 @@ export function App() {
     setPendingImage(null);
     setMiniProfile(null);
     setLightboxImageURL(null);
+    setFriendInviteURL('');
   }
 
   if (!token || !user) {
     const hasInviteInURL = new URLSearchParams(window.location.search).has('invite');
+    const hasFriendInviteInURL = new URLSearchParams(window.location.search).has('friend_invite');
     return (
       <div className="auth-shell">
         {authView === 'verify' ? (
           <form className="auth-card" onSubmit={handleVerifyEmail}>
             <h1>Подтверждение Email</h1>
             <p>Введите код из письма, чтобы завершить вход.</p>
-            <label>
-              Email
-              <input
-                type="email"
-                value={pendingVerificationEmail}
-                onChange={(e) => setPendingVerificationEmail(e.target.value)}
-                required
-              />
-            </label>
+            <small>{pendingVerificationEmail}</small>
             <label>
               Код подтверждения
               <input
@@ -1311,6 +1388,35 @@ export function App() {
             <button type="button" className="ghost" onClick={resendVerificationEmail}>
               Отправить код повторно
             </button>
+            <button type="button" className="ghost" onClick={() => setAuthView('login')}>
+              Назад ко входу
+            </button>
+            {authMessage && <p>{authMessage}</p>}
+            {error && <p className="error">{error}</p>}
+          </form>
+        ) : authView === 'reset' ? (
+          <form className="auth-card" onSubmit={handleResetPasswordSubmit}>
+            <h1>Новый Пароль</h1>
+            <p>Установите новый пароль для аккаунта.</p>
+            <label>
+              Новый пароль
+              <input
+                type="password"
+                value={newPasswordInput}
+                onChange={(e) => setNewPasswordInput(e.target.value)}
+                required
+              />
+            </label>
+            <label>
+              Повторите пароль
+              <input
+                type="password"
+                value={newPasswordConfirmInput}
+                onChange={(e) => setNewPasswordConfirmInput(e.target.value)}
+                required
+              />
+            </label>
+            <button type="submit">Обновить пароль</button>
             <button type="button" className="ghost" onClick={() => setAuthView('login')}>
               Назад ко входу
             </button>
@@ -1351,6 +1457,7 @@ export function App() {
               <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
             </label>
             {hasInviteInURL && <small>После входа вы автоматически присоединитесь по invite-ссылке.</small>}
+            {hasFriendInviteInURL && <small>После входа вы автоматически добавите пользователя в друзья.</small>}
             <button type="submit">{authView === 'login' ? 'Войти' : 'Создать аккаунт'}</button>
             {authView === 'login' ? (
               <>
@@ -1470,6 +1577,13 @@ export function App() {
 
               {sidebarTab === 'friends' && (
                 <div className="friends-panel">
+                  <div className="participants invite-panel">
+                    <strong>Быстрое добавление в друзья</strong>
+                    <button type="button" onClick={generateFriendInviteLink} disabled={creatingFriendInvite}>
+                      {creatingFriendInvite ? 'Создаем...' : 'Ссылка-приглашение'}
+                    </button>
+                    {friendInviteURL && <small className="invite-link-preview">{friendInviteURL}</small>}
+                  </div>
                   <form onSubmit={handleUserSearch} className="new-room-form">
                     <input
                       placeholder="Найти пользователя по имени/email"
@@ -1533,27 +1647,27 @@ export function App() {
           <div className="sidebar-rail">
             <button
               className={`rail-tab ${sidebarTab === 'rooms' ? 'active' : ''}`}
-              onClick={() => setSidebarTab('rooms')}
               type="button"
               title="Комнаты"
+              disabled
             >
               R
               {hasUnreadRooms && <span className="red-dot" />}
             </button>
             <button
               className={`rail-tab ${sidebarTab === 'dms' ? 'active' : ''}`}
-              onClick={() => setSidebarTab('dms')}
               type="button"
               title="Личные сообщения"
+              disabled
             >
               D
               {hasUnreadDMs && <span className="red-dot" />}
             </button>
             <button
               className={`rail-tab ${sidebarTab === 'friends' ? 'active' : ''}`}
-              onClick={() => setSidebarTab('friends')}
               type="button"
               title="Друзья"
+              disabled
             >
               F
               {hasFriendRequestBadge && <span className="red-dot" />}

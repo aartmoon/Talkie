@@ -539,6 +539,15 @@ func (s *Store) SetEmailVerificationToken(ctx context.Context, userID uuid.UUID,
 	return err
 }
 
+func (s *Store) SetPasswordResetToken(ctx context.Context, userID uuid.UUID, tokenHash string, sentAt time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `
+		UPDATE users
+		SET password_reset_token_hash = $2, password_reset_sent_at = $3
+		WHERE id = $1
+	`, userID, tokenHash, sentAt)
+	return err
+}
+
 func (s *Store) VerifyUserByEmailAndTokenHash(ctx context.Context, email, tokenHash string) (User, error) {
 	var u User
 	err := s.DB.QueryRowContext(ctx, `
@@ -558,6 +567,28 @@ func (s *Store) VerifyUserByEmailAndTokenHash(ctx context.Context, email, tokenH
 		return User{}, err
 	}
 	return u, nil
+}
+
+func (s *Store) ResetPasswordByTokenHash(ctx context.Context, tokenHash, passwordHash string) error {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE users
+		SET password_hash = $2,
+		    password_reset_token_hash = NULL
+		WHERE password_reset_token_hash = $1
+		  AND password_reset_sent_at IS NOT NULL
+		  AND password_reset_sent_at >= NOW() - INTERVAL '2 hours'
+	`, tokenHash, passwordHash)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) CreateRoomInviteLink(ctx context.Context, tokenHash string, roomID, createdBy uuid.UUID, expiresAt time.Time) error {
@@ -586,6 +617,44 @@ func (s *Store) JoinRoomByInviteTokenHash(ctx context.Context, tokenHash string,
 		return uuid.Nil, err
 	}
 	return roomID, nil
+}
+
+func (s *Store) CreateFriendInviteLink(ctx context.Context, tokenHash string, createdBy uuid.UUID, expiresAt time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `
+		INSERT INTO friend_invite_links (token_hash, created_by, expires_at)
+		VALUES ($1, $2, $3)
+	`, tokenHash, createdBy, expiresAt)
+	return err
+}
+
+func (s *Store) AddFriendByInviteTokenHash(ctx context.Context, tokenHash string, userID uuid.UUID) (Friend, error) {
+	var inviterID uuid.UUID
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT created_by
+		FROM friend_invite_links
+		WHERE token_hash = $1
+		  AND expires_at > NOW()
+	`, tokenHash).Scan(&inviterID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Friend{}, ErrNotFound
+		}
+		return Friend{}, err
+	}
+	if inviterID == userID {
+		return Friend{}, fmt.Errorf("cannot add self")
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO friendships (user_id, friend_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, inviterID, userID); err != nil {
+		return Friend{}, err
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO friendships (user_id, friend_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, inviterID); err != nil {
+		return Friend{}, err
+	}
+	var f Friend
+	if err := s.DB.QueryRowContext(ctx, `SELECT id, username, email FROM users WHERE id = $1`, inviterID).Scan(&f.ID, &f.Username, &f.Email); err != nil {
+		return Friend{}, err
+	}
+	return f, nil
 }
 
 func nullableString(v string) any {

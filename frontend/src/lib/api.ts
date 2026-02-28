@@ -64,6 +64,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ email }),
     }),
+  forgotPassword: (email: string) =>
+    request<{ ok: boolean }>('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+  resetPassword: (token: string, newPassword: string) =>
+    request<{ ok: boolean }>('/api/auth/reset-password', {
+      method: 'POST',
+      body: JSON.stringify({ token, new_password: newPassword }),
+    }),
   me: (token: string) => request<User>('/api/me', {}, token),
   listRooms: (token: string) => request<Room[]>('/api/rooms', {}, token),
   createRoom: (token: string, name: string) =>
@@ -110,6 +120,10 @@ export const api = {
     ),
   acceptFriendRequest: (token: string, requestID: number) =>
     request<{ ok: boolean }>(`/api/friends/requests/${requestID}/accept`, { method: 'POST' }, token),
+  createFriendInviteLink: (token: string) =>
+    request<InviteLinkResult>('/api/friends/invite-link', { method: 'POST' }, token),
+  acceptFriendInviteLink: (token: string, inviteToken: string) =>
+    request<Friend>(`/api/friends/invite-links/${encodeURIComponent(inviteToken)}/accept`, { method: 'POST' }, token),
   listDMRooms: (token: string) => request<Room[]>('/api/dm/rooms', {}, token),
   openDM: (token: string, userID: string) =>
     request<Room>('/api/dm/rooms', { method: 'POST', body: JSON.stringify({ user_id: userID }) }, token),

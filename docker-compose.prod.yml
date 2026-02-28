@@ -67,6 +67,7 @@ services:
       - "traefik.http.routers.talkie-api.rule=Host(`call.moderium-ai.ru`) && (PathPrefix(`/api`) || PathPrefix(`/ws`) || PathPrefix(`/uploads`) || Path(`/healthz`))"
       - "traefik.http.routers.talkie-api.entrypoints=websecure"
       - "traefik.http.routers.talkie-api.tls.certresolver=${TRAEFIK_CERTRESOLVER}"
+      - "traefik.http.routers.talkie-api.priority=100"
       - "traefik.http.services.talkie-api.loadbalancer.server.port=8080"
 
   frontend:
@@ -83,6 +84,7 @@ services:
       - "traefik.http.routers.talkie-web.rule=Host(`call.moderium-ai.ru`)"
       - "traefik.http.routers.talkie-web.entrypoints=websecure"
       - "traefik.http.routers.talkie-web.tls.certresolver=${TRAEFIK_CERTRESOLVER}"
+      - "traefik.http.routers.talkie-web.priority=10"
       - "traefik.http.services.talkie-web.loadbalancer.server.port=80"
 
 volumes:

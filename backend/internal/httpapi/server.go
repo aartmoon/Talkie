@@ -48,6 +48,8 @@ func (s *Server) Routes() http.Handler {
 		r.Post("/auth/login", s.login)
 		r.Post("/auth/verify-email", s.verifyEmail)
 		r.Post("/auth/resend-verification", s.resendVerification)
+		r.Post("/auth/forgot-password", s.forgotPassword)
+		r.Post("/auth/reset-password", s.resetPassword)
 
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Auth(s.Cfg.JWTSecret))
@@ -65,6 +67,8 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/friends", s.listFriends)
 			r.Post("/friends/requests", s.sendFriendRequest)
 			r.Post("/friends/requests/{requestID}/accept", s.acceptFriendRequest)
+			r.Post("/friends/invite-link", s.createFriendInviteLink)
+			r.Post("/friends/invite-links/{token}/accept", s.acceptFriendInviteLink)
 			r.Get("/dm/rooms", s.listDMRooms)
 			r.Post("/dm/rooms", s.createOrGetDMRoom)
 			r.Post("/invite-links/{token}/join", s.joinByInviteLink)
@@ -235,6 +239,68 @@ func (s *Server) resendVerification(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) forgotPassword(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
+	if req.Email == "" {
+		jsonError(w, http.StatusBadRequest, "email is required")
+		return
+	}
+
+	u, err := s.Store.FindUserByEmail(r.Context(), req.Email)
+	if err == nil {
+		rawToken, tokenErr := randomToken(24)
+		if tokenErr != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to create reset token")
+			return
+		}
+		if saveErr := s.Store.SetPasswordResetToken(r.Context(), u.ID, tokenHash(rawToken), time.Now().UTC()); saveErr != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to save reset token")
+			return
+		}
+		if mailErr := s.sendPasswordResetEmail(u.Email, rawToken); mailErr != nil {
+			log.Printf("failed to send password reset email to %s: %v", u.Email, mailErr)
+		}
+	}
+	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) resetPassword(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token       string `json:"token"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Token = strings.TrimSpace(req.Token)
+	if req.Token == "" || len(req.NewPassword) < 6 {
+		jsonError(w, http.StatusBadRequest, "token and new_password (min 6) are required")
+		return
+	}
+	hash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to hash password")
+		return
+	}
+	if err := s.Store.ResetPasswordByTokenHash(r.Context(), tokenHash(req.Token), hash); err != nil {
+		if err == db.ErrNotFound {
+			jsonError(w, http.StatusBadRequest, "invalid or expired reset token")
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "failed to reset password")
+		return
+	}
 	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -659,6 +725,52 @@ func (s *Server) acceptFriendRequest(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) createFriendInviteLink(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	rawToken, err := randomToken(24)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to create invite token")
+		return
+	}
+	expiresAt := time.Now().UTC().Add(48 * time.Hour)
+	if err := s.Store.CreateFriendInviteLink(r.Context(), tokenHash(rawToken), user.ID, expiresAt); err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to store friend invite link")
+		return
+	}
+	jsonResponse(w, http.StatusCreated, map[string]string{
+		"token":      rawToken,
+		"invite_url": fmt.Sprintf("%s?friend_invite=%s", strings.TrimRight(s.Cfg.FrontendBaseURL, "/"), rawToken),
+		"expires_at": expiresAt.Format(time.RFC3339),
+	})
+}
+
+func (s *Server) acceptFriendInviteLink(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	rawToken := strings.TrimSpace(chi.URLParam(r, "token"))
+	if rawToken == "" {
+		jsonError(w, http.StatusBadRequest, "friend invite token is required")
+		return
+	}
+	friend, err := s.Store.AddFriendByInviteTokenHash(r.Context(), tokenHash(rawToken), user.ID)
+	if err != nil {
+		if err == db.ErrNotFound {
+			jsonError(w, http.StatusNotFound, "friend invite link is invalid or expired")
+			return
+		}
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusOK, friend)
+}
+
 func (s *Server) listDMRooms(w http.ResponseWriter, r *http.Request) {
 	user, ok := middleware.UserFromContext(r.Context())
 	if !ok {
@@ -756,6 +868,31 @@ func (s *Server) sendVerificationEmail(to, code string) error {
 		return nil
 	}
 
+	addr := fmt.Sprintf("%s:%d", s.Cfg.SMTPHost, s.Cfg.SMTPPort)
+	var auth smtp.Auth
+	if s.Cfg.SMTPUser != "" {
+		auth = smtp.PlainAuth("", s.Cfg.SMTPUser, s.Cfg.SMTPPass, s.Cfg.SMTPHost)
+	}
+	return smtp.SendMail(addr, auth, s.Cfg.SMTPFrom, []string{to}, message)
+}
+
+func (s *Server) sendPasswordResetEmail(to, token string) error {
+	frontendBase := strings.TrimRight(s.Cfg.FrontendBaseURL, "/")
+	if frontendBase == "" {
+		frontendBase = "http://localhost:5173"
+	}
+	resetURL := fmt.Sprintf("%s/reset-password?token=%s", frontendBase, token)
+	subject := "Talkie password reset"
+	body := fmt.Sprintf("Open this link to reset your Talkie password:\n\n%s\n\nThe link expires in 2 hours.\n", resetURL)
+	message := []byte("From: " + s.Cfg.SMTPFrom + "\r\n" +
+		"To: " + to + "\r\n" +
+		"Subject: " + subject + "\r\n\r\n" +
+		body)
+
+	if s.Cfg.SMTPHost == "" || s.Cfg.SMTPPort == 0 || s.Cfg.SMTPFrom == "" {
+		log.Printf("password reset link for %s: %s", to, resetURL)
+		return nil
+	}
 	addr := fmt.Sprintf("%s:%d", s.Cfg.SMTPHost, s.Cfg.SMTPPort)
 	var auth smtp.Auth
 	if s.Cfg.SMTPUser != "" {
