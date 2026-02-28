@@ -2,6 +2,16 @@ import type { Friend, FriendsResponse, Message, Participant, Room, User } from '
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 
+export class APIError extends Error {
+  requiresEmailVerification: boolean;
+
+  constructor(message: string, requiresEmailVerification = false) {
+    super(message);
+    this.name = 'APIError';
+    this.requiresEmailVerification = requiresEmailVerification;
+  }
+}
+
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
   const headers = new Headers(options.headers || {});
   const isFormData = options.body instanceof FormData;
@@ -12,18 +22,30 @@ async function request<T>(path: string, options: RequestInit = {}, token?: strin
 
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (!res.ok) {
-    const data = await res.json().catch(() => ({ error: 'request failed' }));
-    throw new Error(data.error || 'request failed');
+    const text = await res.text();
+    let data: {
+      error?: string;
+      requires_email_verification?: boolean;
+    } = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      // Non-JSON error response, keep raw text fallback below.
+    }
+    const message = data.error || text || `request failed (${res.status})`;
+    throw new APIError(message, Boolean(data.requires_email_verification));
   }
   return res.json();
 }
 
 export type AuthResult = { token: string; user: User };
+export type RegisterResult = { user: User; requires_email_verification?: boolean };
+export type InviteLinkResult = { token: string; invite_url: string; expires_at: string };
 
 export const api = {
   apiBase: API_BASE,
   register: (email: string, username: string, password: string) =>
-    request<AuthResult>('/api/auth/register', {
+    request<RegisterResult>('/api/auth/register', {
       method: 'POST',
       body: JSON.stringify({ email, username, password }),
     }),
@@ -32,12 +54,22 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ email, password }),
     }),
+  verifyEmail: (email: string, code: string) =>
+    request<AuthResult>('/api/auth/verify-email', {
+      method: 'POST',
+      body: JSON.stringify({ email, code }),
+    }),
+  resendVerification: (email: string) =>
+    request<{ ok: boolean }>('/api/auth/resend-verification', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
   me: (token: string) => request<User>('/api/me', {}, token),
   listRooms: (token: string) => request<Room[]>('/api/rooms', {}, token),
-  createRoom: (token: string, name: string, isPrivate = false) =>
+  createRoom: (token: string, name: string) =>
     request<Room>('/api/rooms', {
       method: 'POST',
-      body: JSON.stringify({ name, is_private: isPrivate }),
+      body: JSON.stringify({ name }),
     }, token),
   inviteToRoom: (token: string, roomID: string, userID: string) =>
     request<{ ok: boolean }>(
@@ -45,6 +77,10 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ user_id: userID }) },
       token,
     ),
+  createInviteLink: (token: string, roomID: string) =>
+    request<InviteLinkResult>(`/api/rooms/${roomID}/invite-link`, { method: 'POST' }, token),
+  joinByInviteLink: (token: string, inviteToken: string) =>
+    request<Room>(`/api/invite-links/${encodeURIComponent(inviteToken)}/join`, { method: 'POST' }, token),
   joinRoom: (token: string, roomID: string) =>
     request<{ joined: boolean }>(`/api/rooms/${roomID}/join`, { method: 'POST' }, token),
   listMessages: (token: string, roomID: string, limit = 50) =>

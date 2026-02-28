@@ -1,8 +1,15 @@
 package httpapi
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"log"
+	"math/big"
 	"net/http"
+	"net/smtp"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +46,8 @@ func (s *Server) Routes() http.Handler {
 	r.Route("/api", func(r chi.Router) {
 		r.Post("/auth/register", s.register)
 		r.Post("/auth/login", s.login)
+		r.Post("/auth/verify-email", s.verifyEmail)
+		r.Post("/auth/resend-verification", s.resendVerification)
 
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Auth(s.Cfg.JWTSecret))
@@ -47,6 +56,7 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/rooms", s.createRoom)
 			r.Post("/rooms/{roomID}/join", s.joinRoom)
 			r.Post("/rooms/{roomID}/invite", s.inviteToRoom)
+			r.Post("/rooms/{roomID}/invite-link", s.createRoomInviteLink)
 			r.Get("/rooms/{roomID}/messages", s.listMessages)
 			r.Get("/rooms/{roomID}/call-participants", s.listCallParticipants)
 			r.Post("/rooms/{roomID}/images", s.uploadRoomImage)
@@ -57,6 +67,7 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/friends/requests/{requestID}/accept", s.acceptFriendRequest)
 			r.Get("/dm/rooms", s.listDMRooms)
 			r.Post("/dm/rooms", s.createOrGetDMRoom)
+			r.Post("/invite-links/{token}/join", s.joinByInviteLink)
 		})
 	})
 
@@ -72,8 +83,9 @@ type authRequest struct {
 }
 
 type authResponse struct {
-	Token string  `json:"token"`
-	User  db.User `json:"user"`
+	Token                     string  `json:"token,omitempty"`
+	User                      db.User `json:"user"`
+	RequiresEmailVerification bool    `json:"requires_email_verification,omitempty"`
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
@@ -104,14 +116,21 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusConflict, "user already exists")
 		return
 	}
-	token, err := auth.GenerateJWT(s.Cfg.JWTSecret, u.ID, u.Username)
+	verifyCode, err := randomDigits(6)
 	if err != nil {
-		jsonError(w, http.StatusInternalServerError, "failed to generate token")
+		jsonError(w, http.StatusInternalServerError, "failed to create verification code")
 		return
+	}
+	if err := s.Store.SetEmailVerificationToken(r.Context(), u.ID, tokenHash(verifyCode), time.Now().UTC()); err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to save verification code")
+		return
+	}
+	if err := s.sendVerificationEmail(u.Email, verifyCode); err != nil {
+		log.Printf("failed to send verification email to %s: %v", u.Email, err)
 	}
 
 	u.PasswordHash = ""
-	jsonResponse(w, http.StatusCreated, authResponse{Token: token, User: u})
+	jsonResponse(w, http.StatusCreated, authResponse{User: u, RequiresEmailVerification: true})
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +154,13 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
+	if !u.EmailVerified {
+		jsonResponse(w, http.StatusForbidden, map[string]any{
+			"error":                       "email is not verified",
+			"requires_email_verification": true,
+		})
+		return
+	}
 
 	token, err := auth.GenerateJWT(s.Cfg.JWTSecret, u.ID, u.Username)
 	if err != nil {
@@ -144,6 +170,72 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 
 	u.PasswordHash = ""
 	jsonResponse(w, http.StatusOK, authResponse{Token: token, User: u})
+}
+
+func (s *Server) verifyEmail(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email string `json:"email"`
+		Code  string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
+	req.Code = strings.TrimSpace(req.Code)
+	if req.Email == "" || req.Code == "" {
+		jsonError(w, http.StatusBadRequest, "email and code are required")
+		return
+	}
+	u, err := s.Store.VerifyUserByEmailAndTokenHash(r.Context(), req.Email, tokenHash(req.Code))
+	if err != nil {
+		if err == db.ErrNotFound {
+			jsonError(w, http.StatusBadRequest, "invalid or expired verification code")
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "failed to verify email")
+		return
+	}
+	token, err := auth.GenerateJWT(s.Cfg.JWTSecret, u.ID, u.Username)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+	u.PasswordHash = ""
+	jsonResponse(w, http.StatusOK, authResponse{Token: token, User: u})
+}
+
+func (s *Server) resendVerification(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
+	if req.Email == "" {
+		jsonError(w, http.StatusBadRequest, "email is required")
+		return
+	}
+
+	u, err := s.Store.FindUserByEmail(r.Context(), req.Email)
+	if err == nil && !u.EmailVerified {
+		verifyCode, codeErr := randomDigits(6)
+		if codeErr != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to create verification code")
+			return
+		}
+		if saveErr := s.Store.SetEmailVerificationToken(r.Context(), u.ID, tokenHash(verifyCode), time.Now().UTC()); saveErr != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to save verification code")
+			return
+		}
+		if mailErr := s.sendVerificationEmail(u.Email, verifyCode); mailErr != nil {
+			log.Printf("failed to resend verification email to %s: %v", u.Email, mailErr)
+		}
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
@@ -168,8 +260,7 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name      string `json:"name"`
-		IsPrivate bool   `json:"is_private"`
+		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid request body")
@@ -181,7 +272,7 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	room, err := s.Store.CreateRoom(r.Context(), req.Name, user.ID, req.IsPrivate)
+	room, err := s.Store.CreateRoom(r.Context(), req.Name, user.ID, true)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "failed to create room")
 		return
@@ -214,13 +305,8 @@ func (s *Server) inviteToRoom(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid room id")
 		return
 	}
-	room, err := s.Store.GetRoomByID(r.Context(), roomID)
-	if err != nil {
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
 		jsonError(w, http.StatusNotFound, "room not found")
-		return
-	}
-	if !room.IsPrivate {
-		jsonError(w, http.StatusBadRequest, "invites are supported only for private rooms")
 		return
 	}
 	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
@@ -230,6 +316,15 @@ func (s *Server) inviteToRoom(w http.ResponseWriter, r *http.Request) {
 	}
 	if !member {
 		jsonError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	direct, err := s.Store.IsDirectRoom(r.Context(), roomID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check room type")
+		return
+	}
+	if direct {
+		jsonError(w, http.StatusBadRequest, "cannot invite into direct messages")
 		return
 	}
 
@@ -256,6 +351,88 @@ func (s *Server) inviteToRoom(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) createRoomInviteLink(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	roomID, err := uuid.Parse(chi.URLParam(r, "roomID"))
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid room id")
+		return
+	}
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
+		jsonError(w, http.StatusNotFound, "room not found")
+		return
+	}
+	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !member {
+		jsonError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	direct, err := s.Store.IsDirectRoom(r.Context(), roomID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check room type")
+		return
+	}
+	if direct {
+		jsonError(w, http.StatusBadRequest, "invite links are not available for direct messages")
+		return
+	}
+
+	rawToken, err := randomToken(24)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to create invite link")
+		return
+	}
+	expiresAt := time.Now().UTC().Add(24 * time.Hour)
+	if err := s.Store.CreateRoomInviteLink(r.Context(), tokenHash(rawToken), roomID, user.ID, expiresAt); err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to store invite link")
+		return
+	}
+
+	jsonResponse(w, http.StatusCreated, map[string]string{
+		"token":      rawToken,
+		"invite_url": fmt.Sprintf("%s?invite=%s", strings.TrimRight(s.Cfg.FrontendBaseURL, "/"), rawToken),
+		"expires_at": expiresAt.Format(time.RFC3339),
+	})
+}
+
+func (s *Server) joinByInviteLink(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	rawToken := strings.TrimSpace(chi.URLParam(r, "token"))
+	if rawToken == "" {
+		jsonError(w, http.StatusBadRequest, "invite token is required")
+		return
+	}
+
+	roomID, err := s.Store.JoinRoomByInviteTokenHash(r.Context(), tokenHash(rawToken), user.ID)
+	if err != nil {
+		if err == db.ErrNotFound {
+			jsonError(w, http.StatusNotFound, "invite link is invalid or expired")
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "failed to join by invite link")
+		return
+	}
+
+	room, err := s.Store.GetRoomByID(r.Context(), roomID)
+	if err != nil {
+		jsonError(w, http.StatusNotFound, "room not found")
+		return
+	}
+	jsonResponse(w, http.StatusOK, room)
+}
+
 func (s *Server) joinRoom(w http.ResponseWriter, r *http.Request) {
 	user, ok := middleware.UserFromContext(r.Context())
 	if !ok {
@@ -267,24 +444,17 @@ func (s *Server) joinRoom(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid room id")
 		return
 	}
-	room, err := s.Store.GetRoomByID(r.Context(), roomID)
-	if err != nil {
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
 		jsonError(w, http.StatusNotFound, "room not found")
 		return
 	}
-	if room.IsPrivate {
-		member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "failed to check membership")
-			return
-		}
-		if !member {
-			jsonError(w, http.StatusForbidden, "forbidden")
-			return
-		}
+	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check membership")
+		return
 	}
-	if err := s.Store.JoinRoom(r.Context(), roomID, user.ID); err != nil {
-		jsonError(w, http.StatusInternalServerError, "failed to join room")
+	if !member {
+		jsonError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]bool{"joined": true})
@@ -301,23 +471,17 @@ func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid room id")
 		return
 	}
-	room, err := s.Store.GetRoomByID(r.Context(), roomID)
-	if err != nil {
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
 		jsonError(w, http.StatusNotFound, "room not found")
 		return
 	}
-	if room.IsPrivate {
-		member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "failed to check membership")
-			return
-		}
-		if !member {
-			jsonError(w, http.StatusForbidden, "forbidden")
-			return
-		}
-	} else if err := s.Store.JoinRoom(r.Context(), roomID, user.ID); err != nil {
-		jsonError(w, http.StatusInternalServerError, "failed to join room")
+	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !member {
+		jsonError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 
@@ -341,21 +505,18 @@ func (s *Server) listCallParticipants(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid room id")
 		return
 	}
-	room, err := s.Store.GetRoomByID(r.Context(), roomID)
-	if err != nil {
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
 		jsonError(w, http.StatusNotFound, "room not found")
 		return
 	}
-	if room.IsPrivate {
-		member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "failed to check membership")
-			return
-		}
-		if !member {
-			jsonError(w, http.StatusForbidden, "forbidden")
-			return
-		}
+	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !member {
+		jsonError(w, http.StatusForbidden, "forbidden")
+		return
 	}
 
 	participants := s.Hub.CallParticipants(roomID)
@@ -373,23 +534,17 @@ func (s *Server) liveKitToken(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid room id")
 		return
 	}
-	room, err := s.Store.GetRoomByID(r.Context(), roomID)
-	if err != nil {
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
 		jsonError(w, http.StatusNotFound, "room not found")
 		return
 	}
-	if room.IsPrivate {
-		member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "failed to check membership")
-			return
-		}
-		if !member {
-			jsonError(w, http.StatusForbidden, "forbidden")
-			return
-		}
-	} else if err := s.Store.JoinRoom(r.Context(), roomID, user.ID); err != nil {
-		jsonError(w, http.StatusInternalServerError, "failed to join room")
+	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !member {
+		jsonError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 
@@ -556,4 +711,55 @@ func jsonResponse(w http.ResponseWriter, status int, payload any) {
 
 func jsonError(w http.ResponseWriter, status int, msg string) {
 	jsonResponse(w, status, map[string]string{"error": msg})
+}
+
+func randomToken(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func randomDigits(length int) (string, error) {
+	if length <= 0 {
+		return "", fmt.Errorf("invalid code length")
+	}
+	var b strings.Builder
+	b.Grow(length)
+	ten := big.NewInt(10)
+	for i := 0; i < length; i++ {
+		n, err := rand.Int(rand.Reader, ten)
+		if err != nil {
+			return "", err
+		}
+		b.WriteByte(byte('0' + n.Int64()))
+	}
+	return b.String(), nil
+}
+
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Server) sendVerificationEmail(to, code string) error {
+	subject := "Talkie email verification code"
+	body := fmt.Sprintf("Your Talkie verification code is: %s\n\nThe code expires in 24 hours.\n", code)
+	message := []byte("From: " + s.Cfg.SMTPFrom + "\r\n" +
+		"To: " + to + "\r\n" +
+		"Subject: " + subject + "\r\n\r\n" +
+		body)
+
+	if s.Cfg.SMTPHost == "" || s.Cfg.SMTPPort == 0 || s.Cfg.SMTPFrom == "" {
+		log.Printf("verification code for %s: %s", to, code)
+		return nil
+	}
+
+	addr := fmt.Sprintf("%s:%d", s.Cfg.SMTPHost, s.Cfg.SMTPPort)
+	var auth smtp.Auth
+	if s.Cfg.SMTPUser != "" {
+		auth = smtp.PlainAuth("", s.Cfg.SMTPUser, s.Cfg.SMTPPass, s.Cfg.SMTPHost)
+	}
+	return smtp.SendMail(addr, auth, s.Cfg.SMTPFrom, []string{to}, message)
 }

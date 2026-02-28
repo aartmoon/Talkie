@@ -9,8 +9,9 @@ A production-oriented MVP for room-based voice/video + text chat.
 - Frontend: React + Vite + `livekit-client`
 
 ## Features
-- User registration/login (JWT)
-- Create/list/join rooms
+- User registration/login with email verification (JWT)
+- Private-only rooms with member-gated access
+- Quick invite links for private room conversations
 - Room-scoped text chat (WebSocket)
 - Room-scoped LiveKit voice/video sessions
 - Basic room + participant UI
@@ -49,10 +50,14 @@ docker compose down
 ## Core Backend Endpoints
 - `POST /api/auth/register`
 - `POST /api/auth/login`
+- `POST /api/auth/verify-email`
+- `POST /api/auth/resend-verification`
 - `GET /api/me`
 - `GET /api/rooms`
 - `POST /api/rooms`
 - `POST /api/rooms/{roomID}/join`
+- `POST /api/rooms/{roomID}/invite-link`
+- `POST /api/invite-links/{token}/join`
 - `GET /api/rooms/{roomID}/messages`
 - `POST /api/rooms/{roomID}/livekit-token`
 - `GET /ws/rooms/{roomID}?token=<jwt>`

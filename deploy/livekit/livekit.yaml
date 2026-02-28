@@ -7,4 +7,4 @@ rtc:
   port_range_start: 62782
   port_range_end: 62820
 keys:
-  devkey: secret
+  devkey: dev-secret-32-characters-minimum-1234

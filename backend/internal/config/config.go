@@ -14,6 +14,12 @@ type Config struct {
 	LiveKitAPIKey    string
 	LiveKitAPISecret string
 	LiveKitURL       string
+	FrontendBaseURL  string
+	SMTPHost         string
+	SMTPPort         int
+	SMTPUser         string
+	SMTPPass         string
+	SMTPFrom         string
 	MigrationsPath   string
 	UploadsDir       string
 	AllowedOrigins   []string
@@ -27,6 +33,12 @@ func Load() (Config, error) {
 		LiveKitAPIKey:    os.Getenv("LIVEKIT_API_KEY"),
 		LiveKitAPISecret: os.Getenv("LIVEKIT_API_SECRET"),
 		LiveKitURL:       os.Getenv("LIVEKIT_URL"),
+		FrontendBaseURL:  envString("FRONTEND_BASE_URL", "http://localhost:5173"),
+		SMTPHost:         envString("SMTP_HOST", ""),
+		SMTPPort:         envInt("SMTP_PORT", 0),
+		SMTPUser:         envString("SMTP_USER", ""),
+		SMTPPass:         envString("SMTP_PASS", ""),
+		SMTPFrom:         envString("SMTP_FROM", ""),
 		MigrationsPath:   envString("MIGRATIONS_PATH", "migrations"),
 		UploadsDir:       envString("UPLOADS_DIR", "uploads"),
 		AllowedOrigins:   splitCSV(envString("ALLOWED_ORIGINS", "http://localhost:5173")),

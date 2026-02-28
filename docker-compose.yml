@@ -42,8 +42,13 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/talkie?sslmode=disable
       JWT_SECRET: change-me
       LIVEKIT_API_KEY: devkey
-      LIVEKIT_API_SECRET: secret
+      LIVEKIT_API_SECRET: dev-secret-32-characters-minimum-1234
       LIVEKIT_URL: ws://localhost:62780
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-0}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
       ALLOWED_ORIGINS: http://localhost:61873
       MIGRATIONS_PATH: /app/migrations
       UPLOADS_DIR: /app/uploads

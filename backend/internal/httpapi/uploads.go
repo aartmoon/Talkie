@@ -30,23 +30,17 @@ func (s *Server) uploadRoomImage(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid room id")
 		return
 	}
-	room, err := s.Store.GetRoomByID(r.Context(), roomID)
-	if err != nil {
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
 		jsonError(w, http.StatusNotFound, "room not found")
 		return
 	}
-	if room.IsPrivate {
-		member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "failed to check membership")
-			return
-		}
-		if !member {
-			jsonError(w, http.StatusForbidden, "forbidden")
-			return
-		}
-	} else if err := s.Store.JoinRoom(r.Context(), roomID, user.ID); err != nil {
-		jsonError(w, http.StatusInternalServerError, "failed to join room")
+	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !member {
+		jsonError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 

@@ -22,6 +22,7 @@ type User struct {
 	ID           uuid.UUID `json:"id"`
 	Email        string    `json:"email"`
 	Username     string    `json:"username"`
+	EmailVerified bool     `json:"email_verified"`
 	PasswordHash string
 	CreatedAt    time.Time `json:"created_at"`
 }
@@ -53,6 +54,14 @@ type FriendRequest struct {
 type RoomMember struct {
 	ID       uuid.UUID `json:"id"`
 	Username string    `json:"username"`
+}
+
+type RoomInviteLink struct {
+	TokenHash string
+	RoomID    uuid.UUID
+	CreatedBy uuid.UUID
+	CreatedAt time.Time
+	ExpiresAt time.Time
 }
 
 type Message struct {
@@ -90,13 +99,13 @@ func (s *Store) Close() error {
 
 func (s *Store) CreateUser(ctx context.Context, email, username, passwordHash string) (User, error) {
 	query := `
-		INSERT INTO users (email, username, password_hash)
-		VALUES ($1, $2, $3)
-		RETURNING id, email, username, password_hash, created_at
+		INSERT INTO users (email, username, password_hash, email_verified)
+		VALUES ($1, $2, $3, FALSE)
+		RETURNING id, email, username, email_verified, password_hash, created_at
 	`
 	var u User
 	err := s.DB.QueryRowContext(ctx, query, email, username, passwordHash).
-		Scan(&u.ID, &u.Email, &u.Username, &u.PasswordHash, &u.CreatedAt)
+		Scan(&u.ID, &u.Email, &u.Username, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
 		return User{}, err
 	}
@@ -104,10 +113,10 @@ func (s *Store) CreateUser(ctx context.Context, email, username, passwordHash st
 }
 
 func (s *Store) FindUserByEmail(ctx context.Context, email string) (User, error) {
-	query := `SELECT id, email, username, password_hash, created_at FROM users WHERE email = $1`
+	query := `SELECT id, email, username, email_verified, password_hash, created_at FROM users WHERE email = $1`
 	var u User
 	err := s.DB.QueryRowContext(ctx, query, email).
-		Scan(&u.ID, &u.Email, &u.Username, &u.PasswordHash, &u.CreatedAt)
+		Scan(&u.ID, &u.Email, &u.Username, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
@@ -118,10 +127,10 @@ func (s *Store) FindUserByEmail(ctx context.Context, email string) (User, error)
 }
 
 func (s *Store) FindUserByID(ctx context.Context, id uuid.UUID) (User, error) {
-	query := `SELECT id, email, username, password_hash, created_at FROM users WHERE id = $1`
+	query := `SELECT id, email, username, email_verified, password_hash, created_at FROM users WHERE id = $1`
 	var u User
 	err := s.DB.QueryRowContext(ctx, query, id).
-		Scan(&u.ID, &u.Email, &u.Username, &u.PasswordHash, &u.CreatedAt)
+		Scan(&u.ID, &u.Email, &u.Username, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
@@ -132,6 +141,7 @@ func (s *Store) FindUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 }
 
 func (s *Store) CreateRoom(ctx context.Context, name string, createdBy uuid.UUID, isPrivate bool) (Room, error) {
+	isPrivate = true
 	query := `
 		INSERT INTO rooms (name, created_by, is_private)
 		VALUES ($1, $2, $3)
@@ -153,10 +163,10 @@ func (s *Store) ListRoomsForUser(ctx context.Context, userID uuid.UUID) ([]Room,
 	query := `
 		SELECT DISTINCT r.id, r.name, r.created_by, r.is_private, r.created_at
 		FROM rooms r
-		LEFT JOIN room_members rm ON rm.room_id = r.id
+		JOIN room_members rm ON rm.room_id = r.id
 		LEFT JOIN direct_rooms d ON d.room_id = r.id
 		WHERE d.room_id IS NULL
-		  AND (r.is_private = false OR rm.user_id = $1)
+		  AND rm.user_id = $1
 		ORDER BY r.created_at DESC
 	`
 	rows, err := s.DB.QueryContext(ctx, query, userID)
@@ -210,6 +220,12 @@ func (s *Store) GetRoomByID(ctx context.Context, roomID uuid.UUID) (Room, error)
 func (s *Store) IsRoomMember(ctx context.Context, roomID, userID uuid.UUID) (bool, error) {
 	var exists bool
 	err := s.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2)`, roomID, userID).Scan(&exists)
+	return exists, err
+}
+
+func (s *Store) IsDirectRoom(ctx context.Context, roomID uuid.UUID) (bool, error) {
+	var exists bool
+	err := s.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM direct_rooms WHERE room_id = $1)`, roomID).Scan(&exists)
 	return exists, err
 }
 
@@ -512,6 +528,64 @@ func (s *Store) ListMessages(ctx context.Context, roomID uuid.UUID, limit int) (
 		messages[i], messages[j] = messages[j], messages[i]
 	}
 	return messages, nil
+}
+
+func (s *Store) SetEmailVerificationToken(ctx context.Context, userID uuid.UUID, tokenHash string, sentAt time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `
+		UPDATE users
+		SET email_verification_token_hash = $2, email_verification_sent_at = $3
+		WHERE id = $1
+	`, userID, tokenHash, sentAt)
+	return err
+}
+
+func (s *Store) VerifyUserByEmailAndTokenHash(ctx context.Context, email, tokenHash string) (User, error) {
+	var u User
+	err := s.DB.QueryRowContext(ctx, `
+		UPDATE users
+		SET email_verified = TRUE,
+		    email_verification_token_hash = NULL
+		WHERE email = $1
+		  AND email_verification_token_hash = $2
+		  AND email_verification_sent_at IS NOT NULL
+		  AND email_verification_sent_at >= NOW() - INTERVAL '24 hours'
+		RETURNING id, email, username, email_verified, password_hash, created_at
+	`, email, tokenHash).Scan(&u.ID, &u.Email, &u.Username, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, ErrNotFound
+		}
+		return User{}, err
+	}
+	return u, nil
+}
+
+func (s *Store) CreateRoomInviteLink(ctx context.Context, tokenHash string, roomID, createdBy uuid.UUID, expiresAt time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `
+		INSERT INTO room_invite_links (token_hash, room_id, created_by, expires_at)
+		VALUES ($1, $2, $3, $4)
+	`, tokenHash, roomID, createdBy, expiresAt)
+	return err
+}
+
+func (s *Store) JoinRoomByInviteTokenHash(ctx context.Context, tokenHash string, userID uuid.UUID) (uuid.UUID, error) {
+	var roomID uuid.UUID
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT room_id
+		FROM room_invite_links
+		WHERE token_hash = $1
+		  AND expires_at > NOW()
+	`, tokenHash).Scan(&roomID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return uuid.Nil, ErrNotFound
+		}
+		return uuid.Nil, err
+	}
+	if err := s.JoinRoom(ctx, roomID, userID); err != nil {
+		return uuid.Nil, err
+	}
+	return roomID, nil
 }
 
 func nullableString(v string) any {

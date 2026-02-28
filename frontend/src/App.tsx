@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Room, RoomEvent, Track } from 'livekit-client';
-import { api } from './lib/api';
+import { APIError, api } from './lib/api';
 import type { Friend, FriendsResponse, Message, Participant, Room as AppRoom, User } from './lib/types';
 
-type AuthMode = 'login' | 'register';
+type AuthView = 'login' | 'register' | 'verify' | 'forgot';
 type SidebarTab = 'rooms' | 'dms' | 'friends';
 type MiniProfile = { id: string; username: string; email?: string };
 
@@ -93,7 +93,7 @@ function VideoTile({
 }
 
 export function App() {
-  const [mode, setMode] = useState<AuthMode>('login');
+  const [authView, setAuthView] = useState<AuthView>('login');
   const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -113,9 +113,15 @@ export function App() {
   const [hasNewFriendRequest, setHasNewFriendRequest] = useState(false);
   const [miniProfile, setMiniProfile] = useState<MiniProfile | null>(null);
   const [newRoomName, setNewRoomName] = useState('');
-  const [newRoomPrivate, setNewRoomPrivate] = useState(false);
   const [inviteQuery, setInviteQuery] = useState('');
   const [inviteResults, setInviteResults] = useState<Friend[]>([]);
+  const [generatedInviteURL, setGeneratedInviteURL] = useState('');
+  const [generatingInviteLink, setGeneratingInviteLink] = useState(false);
+  const [pendingVerificationEmail, setPendingVerificationEmail] = useState('');
+  const [verificationTokenInput, setVerificationTokenInput] = useState('');
+  const [isVerifyingEmail, setIsVerifyingEmail] = useState(false);
+  const [authMessage, setAuthMessage] = useState<string | null>(null);
+  const [roomActivityByID, setRoomActivityByID] = useState<Record<string, number>>({});
   const [selectedRoom, setSelectedRoom] = useState<AppRoom | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState('');
@@ -154,8 +160,22 @@ export function App() {
   const incomingRequestsRef = useRef(0);
   const selectedRoomIDRef = useRef<string | null>(null);
   const lastRoomMessageIDsRef = useRef<Record<string, number>>({});
+  const inviteJoinHandledRef = useRef(false);
 
-  const sortedRooms = useMemo(() => [...rooms], [rooms]);
+  const sortedRooms = useMemo(
+    () =>
+      [...rooms].sort(
+        (a, b) => (roomActivityByID[b.id] || new Date(b.created_at).getTime()) - (roomActivityByID[a.id] || new Date(a.created_at).getTime()),
+      ),
+    [rooms, roomActivityByID],
+  );
+  const sortedDMRooms = useMemo(
+    () =>
+      [...dmRooms].sort(
+        (a, b) => (roomActivityByID[b.id] || new Date(b.created_at).getTime()) - (roomActivityByID[a.id] || new Date(a.created_at).getTime()),
+      ),
+    [dmRooms, roomActivityByID],
+  );
   const hasUnreadRooms = useMemo(
     () => rooms.some((room) => (unreadByRoom[room.id] || 0) > 0),
     [rooms, unreadByRoom],
@@ -182,6 +202,10 @@ export function App() {
     if (!activeCallRoom) return null;
     return dmRooms.some((room) => room.id === activeCallRoom.id) ? 'dm' : 'room';
   }, [activeCallRoom, dmRooms]);
+  const selectedRoomIsDM = useMemo(
+    () => Boolean(selectedRoom && dmRooms.some((room) => room.id === selectedRoom.id)),
+    [selectedRoom, dmRooms],
+  );
 
   function videoKey(participantID: string, source: Track.Source, sid?: string): string {
     return sid || `${participantID}-${source}`;
@@ -217,6 +241,13 @@ export function App() {
         setRooms(list);
         setDMRooms(dms);
         setFriendsData(friends);
+        setRoomActivityByID((prev) => {
+          const next = { ...prev };
+          for (const room of [...list, ...dms]) {
+            if (!next[room.id]) next[room.id] = new Date(room.created_at).getTime();
+          }
+          return next;
+        });
         incomingRequestsRef.current = friends.incoming.length;
         friendsInitRef.current = true;
       } catch (err) {
@@ -226,6 +257,40 @@ export function App() {
       }
     })();
   }, [token]);
+
+  useEffect(() => {
+    if (!token || !user || inviteJoinHandledRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const inviteToken = params.get('invite');
+    if (!inviteToken) return;
+
+    inviteJoinHandledRef.current = true;
+    let mounted = true;
+    setError(null);
+    void api.joinByInviteLink(token, inviteToken)
+      .then(async (room) => {
+        if (!mounted) return;
+        const [list, dms] = await Promise.all([api.listRooms(token), api.listDMRooms(token)]);
+        if (!mounted) return;
+        setRooms(list);
+        setDMRooms(dms);
+        setRoomActivityByID((prev) => ({ ...prev, [room.id]: Date.now() }));
+        await openRoom(room);
+      })
+      .catch((err) => {
+        if (!mounted) return;
+        setError(err instanceof Error ? err.message : 'failed to join via invite link');
+      })
+      .finally(() => {
+        params.delete('invite');
+        const next = window.location.pathname + (params.toString() ? `?${params.toString()}` : '');
+        window.history.replaceState({}, '', next);
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, [token, user]);
 
   useEffect(() => {
     if (!token || !user) return;
@@ -245,6 +310,20 @@ export function App() {
         }),
       );
       if (!mounted) return;
+
+      setRoomActivityByID((prev) => {
+        const next = { ...prev };
+        let changed = false;
+        for (const item of latestByRoom) {
+          if (!item.message) continue;
+          const ts = new Date(item.message.created_at).getTime();
+          if ((next[item.roomID] || 0) < ts) {
+            next[item.roomID] = ts;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
 
       setUnreadByRoom((prev) => {
         const next = { ...prev };
@@ -393,16 +472,26 @@ export function App() {
   useEffect(() => {
     setInviteQuery('');
     setInviteResults([]);
+    setGeneratedInviteURL('');
   }, [selectedRoom?.id]);
 
   async function handleAuthSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    setAuthMessage(null);
     try {
-      const result =
-        mode === 'login'
-          ? await api.login(email, password)
-          : await api.register(email, username, password);
+      if (authView === 'register') {
+        await api.register(email, username, password);
+        setPendingVerificationEmail(email.trim().toLowerCase());
+        setVerificationTokenInput('');
+        setPassword('');
+        setAuthView('verify');
+        setAuthMessage('Код подтверждения отправлен на email.');
+        return;
+      }
+      if (authView !== 'login') return;
+
+      const result = await api.login(email, password);
       localStorage.setItem('talkie_token', result.token);
       setToken(result.token);
       setUser(result.user);
@@ -417,18 +506,64 @@ export function App() {
       incomingRequestsRef.current = friends.incoming.length;
       friendsInitRef.current = true;
     } catch (err) {
+      if (err instanceof APIError && err.requiresEmailVerification) {
+        setPendingVerificationEmail(email.trim().toLowerCase());
+        setAuthView('verify');
+        setAuthMessage('Введите код подтверждения из письма.');
+        return;
+      }
       setError(err instanceof Error ? err.message : 'request failed');
     }
+  }
+
+  async function handleVerifyEmail(e: React.FormEvent) {
+    e.preventDefault();
+    const codeInput = verificationTokenInput.trim();
+    if (!codeInput || !pendingVerificationEmail.trim()) return;
+    setError(null);
+    setAuthMessage(null);
+    setIsVerifyingEmail(true);
+    try {
+      const result = await api.verifyEmail(pendingVerificationEmail.trim(), codeInput);
+      localStorage.setItem('talkie_token', result.token);
+      setToken(result.token);
+      setUser(result.user);
+      setPendingVerificationEmail('');
+      setVerificationTokenInput('');
+      setAuthView('login');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to verify email');
+    } finally {
+      setIsVerifyingEmail(false);
+    }
+  }
+
+  async function resendVerificationEmail() {
+    if (!pendingVerificationEmail.trim()) return;
+    setError(null);
+    setAuthMessage(null);
+    try {
+      await api.resendVerification(pendingVerificationEmail.trim());
+      setAuthMessage('Код отправлен повторно.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to resend verification');
+    }
+  }
+
+  function handleForgotPasswordSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setAuthMessage('Сброс пароля пока не реализован. Напишите в поддержку.');
   }
 
   async function createRoom(e: React.FormEvent) {
     e.preventDefault();
     if (!token || !newRoomName.trim()) return;
     try {
-      const room = await api.createRoom(token, newRoomName.trim(), newRoomPrivate);
+      const room = await api.createRoom(token, newRoomName.trim());
       setRooms((prev) => [room, ...prev]);
+      setRoomActivityByID((prev) => ({ ...prev, [room.id]: new Date(room.created_at).getTime() }));
       setNewRoomName('');
-      setNewRoomPrivate(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create room');
     }
@@ -454,6 +589,12 @@ export function App() {
       setMessages(history);
       if (history.length > 0) {
         lastRoomMessageIDsRef.current[room.id] = history[history.length - 1].id;
+        setRoomActivityByID((prev) => ({
+          ...prev,
+          [room.id]: new Date(history[history.length - 1].created_at).getTime(),
+        }));
+      } else {
+        setRoomActivityByID((prev) => ({ ...prev, [room.id]: new Date(room.created_at).getTime() }));
       }
 
       const wsUrl = `${wsBaseUrl(api.apiBase)}/ws/rooms/${room.id}?token=${encodeURIComponent(token)}`;
@@ -474,6 +615,7 @@ export function App() {
         if (payload.type === 'chat' && payload.message) {
           const incomingMessage = payload.message;
           setMessages((prev) => [...prev, incomingMessage]);
+          setRoomActivityByID((prev) => ({ ...prev, [room.id]: new Date(incomingMessage.created_at).getTime() }));
           if (incomingMessage.user_id !== user?.id && selectedRoomIDRef.current !== room.id) {
             playNotifyTone('message');
             setUnreadByRoom((prev) => ({ ...prev, [room.id]: (prev[room.id] || 0) + 1 }));
@@ -1032,7 +1174,7 @@ export function App() {
 
   async function handleInviteSearch(e: React.FormEvent) {
     e.preventDefault();
-    if (!token || !selectedRoom?.is_private) return;
+    if (!token || !selectedRoom || selectedRoomIsDM) return;
     const q = inviteQuery.trim();
     if (!q) {
       setInviteResults([]);
@@ -1047,13 +1189,28 @@ export function App() {
   }
 
   async function inviteUserToRoom(userID: string) {
-    if (!token || !selectedRoom?.is_private) return;
+    if (!token || !selectedRoom || selectedRoomIsDM) return;
     try {
       await api.inviteToRoom(token, selectedRoom.id, userID);
       setInviteResults((prev) => prev.filter((u) => u.id !== userID));
       setInviteQuery('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to invite user');
+    }
+  }
+
+  async function generateInviteLink() {
+    if (!token || !selectedRoom) return;
+    setGeneratingInviteLink(true);
+    setError(null);
+    try {
+      const result = await api.createInviteLink(token, selectedRoom.id);
+      setGeneratedInviteURL(result.invite_url);
+      await navigator.clipboard?.writeText(result.invite_url).catch(() => {});
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to create invite link');
+    } finally {
+      setGeneratingInviteLink(false);
     }
   }
 
@@ -1116,41 +1273,103 @@ export function App() {
     incomingRequestsRef.current = 0;
     lastRoomMessageIDsRef.current = {};
     selectedRoomIDRef.current = null;
+    inviteJoinHandledRef.current = false;
     setPendingImage(null);
     setMiniProfile(null);
     setLightboxImageURL(null);
   }
 
   if (!token || !user) {
+    const hasInviteInURL = new URLSearchParams(window.location.search).has('invite');
     return (
       <div className="auth-shell">
-        <form className="auth-card" onSubmit={handleAuthSubmit}>
-          <h1>Talkie</h1>
-          <p>Голосовые комнаты, видеозвонки и чат в стиле Discord.</p>
-          <label>
-            Email
-            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
-          </label>
-          {mode === 'register' && (
+        {authView === 'verify' ? (
+          <form className="auth-card" onSubmit={handleVerifyEmail}>
+            <h1>Подтверждение Email</h1>
+            <p>Введите код из письма, чтобы завершить вход.</p>
             <label>
-              Username
-              <input value={username} onChange={(e) => setUsername(e.target.value)} required />
+              Email
+              <input
+                type="email"
+                value={pendingVerificationEmail}
+                onChange={(e) => setPendingVerificationEmail(e.target.value)}
+                required
+              />
             </label>
-          )}
-          <label>
-            Password
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
-          </label>
-          <button type="submit">{mode === 'login' ? 'Войти' : 'Создать аккаунт'}</button>
-          <button
-            type="button"
-            className="ghost"
-            onClick={() => setMode((prev) => (prev === 'login' ? 'register' : 'login'))}
-          >
-            {mode === 'login' ? 'Нет аккаунта? Зарегистрироваться' : 'Уже есть аккаунт? Войти'}
-          </button>
-          {error && <p className="error">{error}</p>}
-        </form>
+            <label>
+              Код подтверждения
+              <input
+                value={verificationTokenInput}
+                onChange={(e) => setVerificationTokenInput(e.target.value)}
+                placeholder="6-значный код"
+                required
+              />
+            </label>
+            <button type="submit" disabled={isVerifyingEmail}>
+              {isVerifyingEmail ? 'Проверка...' : 'Подтвердить код'}
+            </button>
+            <button type="button" className="ghost" onClick={resendVerificationEmail}>
+              Отправить код повторно
+            </button>
+            <button type="button" className="ghost" onClick={() => setAuthView('login')}>
+              Назад ко входу
+            </button>
+            {authMessage && <p>{authMessage}</p>}
+            {error && <p className="error">{error}</p>}
+          </form>
+        ) : authView === 'forgot' ? (
+          <form className="auth-card" onSubmit={handleForgotPasswordSubmit}>
+            <h1>Сброс Пароля</h1>
+            <p>Введите email, к которому привязан аккаунт.</p>
+            <label>
+              Email
+              <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
+            </label>
+            <button type="submit">Сбросить пароль</button>
+            <button type="button" className="ghost" onClick={() => setAuthView('login')}>
+              Назад ко входу
+            </button>
+            {authMessage && <p>{authMessage}</p>}
+            {error && <p className="error">{error}</p>}
+          </form>
+        ) : (
+          <form className="auth-card" onSubmit={handleAuthSubmit}>
+            <h1>Talkie</h1>
+            <p>Голосовые комнаты, видеозвонки и чат в стиле Discord.</p>
+            <label>
+              Email
+              <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
+            </label>
+            {authView === 'register' && (
+              <label>
+                Username
+                <input value={username} onChange={(e) => setUsername(e.target.value)} required />
+              </label>
+            )}
+            <label>
+              Password
+              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+            </label>
+            {hasInviteInURL && <small>После входа вы автоматически присоединитесь по invite-ссылке.</small>}
+            <button type="submit">{authView === 'login' ? 'Войти' : 'Создать аккаунт'}</button>
+            {authView === 'login' ? (
+              <>
+                <button type="button" className="ghost" onClick={() => setAuthView('register')}>
+                  Нет аккаунта? Зарегистрироваться
+                </button>
+                <button type="button" className="ghost" onClick={() => setAuthView('forgot')}>
+                  Забыли пароль?
+                </button>
+              </>
+            ) : (
+              <button type="button" className="ghost" onClick={() => setAuthView('login')}>
+                Уже есть аккаунт? Войти
+              </button>
+            )}
+            {authMessage && <p>{authMessage}</p>}
+            {error && <p className="error">{error}</p>}
+          </form>
+        )}
       </div>
     );
   }
@@ -1212,14 +1431,6 @@ export function App() {
                       value={newRoomName}
                       onChange={(e) => setNewRoomName(e.target.value)}
                     />
-                    <label className="private-toggle">
-                      <input
-                        type="checkbox"
-                        checked={newRoomPrivate}
-                        onChange={(e) => setNewRoomPrivate(e.target.checked)}
-                      />
-                      Приватная
-                    </label>
                     <button type="submit">Создать</button>
                   </form>
 
@@ -1232,7 +1443,6 @@ export function App() {
                         >
                           <span className="room-hash">#</span>
                           <span className="room-name">{room.name}</span>
-                          {room.is_private && <span className="room-private-badge">приват</span>}
                           {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
                         </button>
                       </li>
@@ -1243,7 +1453,7 @@ export function App() {
 
               {sidebarTab === 'dms' && (
                 <ul className="room-list">
-                  {dmRooms.map((room) => (
+                  {sortedDMRooms.map((room) => (
                     <li key={room.id}>
                       <button
                         className={selectedRoom?.id === room.id ? 'active' : ''}
@@ -1543,31 +1753,41 @@ export function App() {
               </section>
 
               <section className="members-panel">
-                {selectedRoom.is_private && (
-                  <div className="participants invite-panel">
-                    <strong>Приватные приглашения</strong>
-                    <form onSubmit={handleInviteSearch} className="invite-form">
-                      <input
-                        placeholder="Найти пользователя по имени/email"
-                        value={inviteQuery}
-                        onChange={(e) => setInviteQuery(e.target.value)}
-                      />
-                      <button type="submit">Найти</button>
-                    </form>
-                    {inviteResults.length > 0 && (
-                      <ul className="participant-list">
-                        {inviteResults.map((candidate) => (
-                          <li key={candidate.id}>
-                            <span className="participant-name">{candidate.username}</span>
-                            <button type="button" onClick={() => inviteUserToRoom(candidate.id)}>
-                              Пригласить
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                )}
+                <div className="participants invite-panel">
+                  <strong>Приглашения</strong>
+                  {selectedRoomIsDM ? (
+                    <small>В личные сообщения нельзя приглашать по ссылке.</small>
+                  ) : (
+                    <>
+                      <button type="button" onClick={generateInviteLink} disabled={generatingInviteLink}>
+                        {generatingInviteLink ? 'Создаем...' : 'Быстрая invite-ссылка'}
+                      </button>
+                      {generatedInviteURL && (
+                        <small className="invite-link-preview">{generatedInviteURL}</small>
+                      )}
+                    </>
+                  )}
+                  <form onSubmit={handleInviteSearch} className="invite-form">
+                    <input
+                      placeholder="Найти пользователя по имени/email"
+                      value={inviteQuery}
+                      onChange={(e) => setInviteQuery(e.target.value)}
+                    />
+                    <button type="submit">Найти</button>
+                  </form>
+                  {inviteResults.length > 0 && (
+                    <ul className="participant-list">
+                      {inviteResults.map((candidate) => (
+                        <li key={candidate.id}>
+                          <span className="participant-name">{candidate.username}</span>
+                          <button type="button" onClick={() => inviteUserToRoom(candidate.id)}>
+                            Пригласить
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
                 <div className="participants">
                   <strong>В чате</strong>
                   {chatParticipants.length === 0 ? (

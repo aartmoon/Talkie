@@ -816,6 +816,12 @@ button.logout {
   gap: 8px;
 }
 
+.invite-link-preview {
+  display: block;
+  word-break: break-all;
+  color: #a7b8ec;
+}
+
 .invite-form {
   display: flex;
   gap: 8px;

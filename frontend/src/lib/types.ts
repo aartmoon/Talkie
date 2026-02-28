@@ -2,6 +2,7 @@ export type User = {
   id: string;
   email: string;
   username: string;
+  email_verified?: boolean;
   created_at: string;
 };
 
