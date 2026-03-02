@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import { APIError, api } from './lib/api';
 import type { Friend, FriendsResponse, Message, Participant, Room as AppRoom, User } from './lib/types';
+import { FriendsPanel } from './components/FriendsPanel';
 
 type AuthView = 'login' | 'register' | 'verify' | 'forgot' | 'reset';
 type SidebarTab = 'rooms' | 'dms' | 'friends';
@@ -1907,63 +1908,21 @@ export function App() {
               )}
 
               {sidebarTab === 'friends' && (
-                <div className="friends-panel">
-                  <div className="participants invite-panel">
-                    <strong>Быстрое добавление в друзья</strong>
-                    <button type="button" onClick={generateFriendInviteLink} disabled={creatingFriendInvite}>
-                      {creatingFriendInvite ? 'Создаем...' : 'Ссылка-приглашение'}
-                    </button>
-                    {copyNotice && <small className="copy-notice">{copyNotice}</small>}
-                  </div>
-                  <form onSubmit={handleUserSearch} className="new-room-form">
-                    <input
-                      placeholder="Найти пользователя по имени/email"
-                      value={userSearchQuery}
-                      onChange={(e) => setUserSearchQuery(e.target.value)}
-                    />
-                    <button type="submit">Найти</button>
-                  </form>
-                  <ul className="room-list">
-                    {userSearchResults.map((f) => (
-                      <li key={f.id}>
-                        <button
-                          onClick={() => addFriend(f.id)}
-                          type="button"
-                          disabled={Boolean(sentFriendRequests[f.id]) || friendsData.friends.some((x) => x.id === f.id)}
-                        >
-                          {friendsData.friends.some((x) => x.id === f.id)
-                            ? `Уже в друзьях: ${f.username}`
-                            : sentFriendRequests[f.id]
-                              ? `Запрос отправлен: ${f.username}`
-                              : `+ ${f.username}`}
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                  <div className="participants">
-                    <strong>Заявки</strong>
-                    <ul className="participant-list">
-                      {friendsData.incoming.map((fr) => (
-                        <li key={fr.id}>
-                          <span className="participant-name">{fr.requester_username}</span>
-                          <button type="button" onClick={() => acceptFriend(fr.id)}>Принять</button>
-                          <button type="button" className="ghost" onClick={() => declineFriend(fr.id)}>Отклонить</button>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                  <div className="participants">
-                    <strong>Друзья</strong>
-                    <ul className="participant-list">
-                      {friendsData.friends.map((f) => (
-                        <li key={f.id}>
-                          <span className="participant-name">{f.username}</span>
-                          <button type="button" onClick={() => openDMWith(f.id)}>Написать</button>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
+                <FriendsPanel
+                  creatingFriendInvite={creatingFriendInvite}
+                  copyNotice={copyNotice}
+                  friendsData={friendsData}
+                  sentFriendRequests={sentFriendRequests}
+                  userSearchQuery={userSearchQuery}
+                  userSearchResults={userSearchResults}
+                  onAddFriend={(userID) => addFriend(userID)}
+                  onAcceptFriend={(requestID) => acceptFriend(requestID)}
+                  onDeclineFriend={(requestID) => declineFriend(requestID)}
+                  onGenerateFriendInviteLink={() => generateFriendInviteLink()}
+                  onOpenDMWith={(userID) => openDMWith(userID)}
+                  onSearchChange={(nextQuery) => setUserSearchQuery(nextQuery)}
+                  onSearchSubmit={handleUserSearch}
+                />
               )}
             </div>
 

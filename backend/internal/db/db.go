@@ -464,10 +464,10 @@ func (s *Store) CreateFriendRequest(ctx context.Context, requesterID, addresseeI
 	return nil
 }
 
-func (s *Store) AcceptFriendRequest(ctx context.Context, reqID int64, userID uuid.UUID) error {
+func (s *Store) AcceptFriendRequest(ctx context.Context, reqID int64, userID uuid.UUID) (uuid.UUID, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return uuid.Nil, err
 	}
 	defer tx.Rollback()
 
@@ -480,26 +480,29 @@ func (s *Store) AcceptFriendRequest(ctx context.Context, reqID int64, userID uui
 		FOR UPDATE
 	`, reqID).Scan(&requesterID, &addresseeID, &status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
+			return uuid.Nil, ErrNotFound
 		}
-		return err
+		return uuid.Nil, err
 	}
 	if addresseeID != userID {
-		return ErrNotFound
+		return uuid.Nil, ErrNotFound
 	}
 	if status != "pending" {
-		return nil
+		return requesterID, nil
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE friend_requests SET status = 'accepted' WHERE id = $1`, reqID); err != nil {
-		return err
+		return uuid.Nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO friendships (user_id, friend_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, requesterID, addresseeID); err != nil {
-		return err
+		return uuid.Nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO friendships (user_id, friend_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, addresseeID, requesterID); err != nil {
-		return err
+		return uuid.Nil, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return uuid.Nil, err
+	}
+	return requesterID, nil
 }
 
 func (s *Store) DeclineFriendRequest(ctx context.Context, reqID int64, userID uuid.UUID) error {
