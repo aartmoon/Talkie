@@ -11,6 +11,8 @@ export type Room = {
   name: string;
   created_by: string;
   is_private?: boolean;
+  my_role?: 'admin' | 'member';
+  can_manage?: boolean;
   created_at: string;
 };
 

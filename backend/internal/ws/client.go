@@ -86,11 +86,30 @@ func (c *Client) ReadPump() {
 			Type:    "chat",
 			Message: ptrPayload(PayloadFromMessage(msg)),
 		})
+		c.notifyRoomMessage(msg)
 	}
 }
 
 func ptrPayload(p MessagePayload) *MessagePayload {
 	return &p
+}
+
+func (c *Client) notifyRoomMessage(msg db.Message) {
+	members, err := c.Store.ListRoomMembers(context.Background(), c.RoomID)
+	if err != nil {
+		log.Printf("list members for room event failed: %v", err)
+		return
+	}
+	payload := ptrPayload(PayloadFromMessage(msg))
+	for _, m := range members {
+		if m.ID == c.UserID {
+			continue
+		}
+		c.Hub.BroadcastUser(m.ID, OutgoingMessage{
+			Type:    "room_message_event",
+			Message: payload,
+		})
+	}
 }
 
 func (c *Client) WritePump() {

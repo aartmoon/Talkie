@@ -104,6 +104,7 @@ func (s *Server) uploadRoomImage(w http.ResponseWriter, r *http.Request) {
 
 	payload := ws.PayloadFromMessage(msg)
 	s.Hub.Broadcast(roomID, ws.OutgoingMessage{Type: "chat", Message: &payload})
+	s.broadcastRoomMessageEvent(r.Context(), roomID, user.ID, payload)
 	jsonResponse(w, http.StatusCreated, msg)
 }
 

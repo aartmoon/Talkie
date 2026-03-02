@@ -51,6 +51,15 @@ function isScreenAudioSource(source: Track.Source): boolean {
   return source === Track.Source.ScreenShareAudio || source === Track.Source.ScreenShare;
 }
 
+function clamp01(v: number): number {
+  if (Number.isNaN(v)) return 1;
+  return Math.max(0, Math.min(1, v));
+}
+
+function volumeKey(kind: 'voice' | 'screen', participantID: string): string {
+  return `talkie_${kind}_volume_${participantID}`;
+}
+
 function VideoTile({
   item,
   muted,
@@ -113,9 +122,9 @@ export function App() {
   const [hasNewFriendRequest, setHasNewFriendRequest] = useState(false);
   const [miniProfile, setMiniProfile] = useState<MiniProfile | null>(null);
   const [newRoomName, setNewRoomName] = useState('');
+  const [showCreateRoomModal, setShowCreateRoomModal] = useState(false);
   const [inviteQuery, setInviteQuery] = useState('');
   const [inviteResults, setInviteResults] = useState<Friend[]>([]);
-  const [generatedInviteURL, setGeneratedInviteURL] = useState('');
   const [generatingInviteLink, setGeneratingInviteLink] = useState(false);
   const [pendingVerificationEmail, setPendingVerificationEmail] = useState('');
   const [verificationTokenInput, setVerificationTokenInput] = useState('');
@@ -124,9 +133,11 @@ export function App() {
   const [resetToken, setResetToken] = useState('');
   const [newPasswordInput, setNewPasswordInput] = useState('');
   const [newPasswordConfirmInput, setNewPasswordConfirmInput] = useState('');
-  const [friendInviteURL, setFriendInviteURL] = useState('');
   const [creatingFriendInvite, setCreatingFriendInvite] = useState(false);
+  const [copyNotice, setCopyNotice] = useState<string | null>(null);
+  const [roomMenuOpen, setRoomMenuOpen] = useState(false);
   const [roomActivityByID, setRoomActivityByID] = useState<Record<string, number>>({});
+  const [activeCallsByRoom, setActiveCallsByRoom] = useState<Record<string, number>>({});
   const [selectedRoom, setSelectedRoom] = useState<AppRoom | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState('');
@@ -144,6 +155,8 @@ export function App() {
     () => localStorage.getItem('talkie_join_with_mic') !== '0',
   );
   const [showMicSettings, setShowMicSettings] = useState(false);
+  const [participantVoiceVolume, setParticipantVoiceVolume] = useState<Record<string, number>>({});
+  const [participantScreenVolume, setParticipantScreenVolume] = useState<Record<string, number>>({});
   const [watchedVideoKeys, setWatchedVideoKeys] = useState<Record<string, boolean>>({});
   const [videoTracks, setVideoTracks] = useState<VideoTrackItem[]>([]);
   const [focusedTileKey, setFocusedTileKey] = useState<string | null>(null);
@@ -153,7 +166,11 @@ export function App() {
   const [refreshTick, setRefreshTick] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const eventsWsRef = useRef<WebSocket | null>(null);
+  const roomWsReconnectRef = useRef<number | null>(null);
   const roomRef = useRef<Room | null>(null);
+  const roomsRef = useRef<AppRoom[]>([]);
+  const dmRoomsRef = useRef<AppRoom[]>([]);
   const callRoomIDRef = useRef<string | null>(null);
   const audioElsRef = useRef<Map<string, { participantID: string; source: Track.Source; el: HTMLAudioElement }>>(new Map());
   const messagesRef = useRef<HTMLDivElement | null>(null);
@@ -164,6 +181,7 @@ export function App() {
   const friendsInitRef = useRef(false);
   const incomingRequestsRef = useRef(0);
   const selectedRoomIDRef = useRef<string | null>(null);
+  const sidebarTabRef = useRef<SidebarTab>('rooms');
   const lastRoomMessageIDsRef = useRef<Record<string, number>>({});
   const inviteJoinHandledRef = useRef(false);
 
@@ -189,7 +207,7 @@ export function App() {
     () => dmRooms.some((room) => (unreadByRoom[room.id] || 0) > 0),
     [dmRooms, unreadByRoom],
   );
-  const hasFriendRequestBadge = hasNewFriendRequest || friendsData.incoming.length > 0;
+  const hasFriendRequestBadge = hasNewFriendRequest;
   const friendIDs = useMemo(() => new Set(friendsData.friends.map((f) => f.id)), [friendsData.friends]);
   const focusedTile = useMemo(
     () => videoTracks.find((track) => track.key === focusedTileKey) || videoTracks[0] || null,
@@ -211,6 +229,7 @@ export function App() {
     () => Boolean(selectedRoom && dmRooms.some((room) => room.id === selectedRoom.id)),
     [selectedRoom, dmRooms],
   );
+  const selectedRoomCanManage = Boolean(selectedRoom?.can_manage);
 
   function videoKey(participantID: string, source: Track.Source, sid?: string): string {
     return sid || `${participantID}-${source}`;
@@ -219,6 +238,12 @@ export function App() {
   useEffect(() => {
     deafenedRef.current = deafened;
   }, [deafened]);
+
+  useEffect(() => {
+    if (!copyNotice) return;
+    const id = window.setTimeout(() => setCopyNotice(null), 2200);
+    return () => window.clearTimeout(id);
+  }, [copyNotice]);
 
   useEffect(() => {
     watchedVideoKeysRef.current = watchedVideoKeys;
@@ -231,6 +256,18 @@ export function App() {
   useEffect(() => {
     selectedRoomIDRef.current = selectedRoom?.id || null;
   }, [selectedRoom?.id]);
+
+  useEffect(() => {
+    roomsRef.current = rooms;
+  }, [rooms]);
+
+  useEffect(() => {
+    dmRoomsRef.current = dmRooms;
+  }, [dmRooms]);
+
+  useEffect(() => {
+    sidebarTabRef.current = sidebarTab;
+  }, [sidebarTab]);
 
   useEffect(() => {
     if (!token) return;
@@ -332,63 +369,170 @@ export function App() {
 
   useEffect(() => {
     if (!token || !user) return;
+    let stopped = false;
+    let reconnectID: number | null = null;
+
+    const connect = () => {
+      if (stopped) return;
+      const wsUrl = `${wsBaseUrl(api.apiBase)}/ws/events?token=${encodeURIComponent(token)}`;
+      const socket = new WebSocket(wsUrl);
+      eventsWsRef.current = socket;
+
+      socket.onmessage = (event) => {
+        const payload = JSON.parse(event.data) as {
+          type: string;
+          message?: Message;
+        };
+        if (payload.type === 'room_message_event' && payload.message) {
+          const incomingMessage = payload.message;
+          if (incomingMessage.user_id === user.id) return;
+
+          const roomID = incomingMessage.room_id;
+          const knownRoom = roomsRef.current.some((r) => r.id === roomID) || dmRoomsRef.current.some((r) => r.id === roomID);
+          if (!knownRoom) {
+            void api.listDMRooms(token)
+              .then((dms) => setDMRooms(dms))
+              .catch(() => {
+                // best effort
+              });
+          }
+          lastRoomMessageIDsRef.current[roomID] = incomingMessage.id;
+          setRoomActivityByID((prev) => {
+            const ts = new Date(incomingMessage.created_at).getTime();
+            if ((prev[roomID] || 0) >= ts) return prev;
+            return { ...prev, [roomID]: ts };
+          });
+          if (selectedRoomIDRef.current !== roomID) {
+            setUnreadByRoom((prev) => ({ ...prev, [roomID]: (prev[roomID] || 0) + 1 }));
+          }
+          return;
+        }
+        if (payload.type === 'friend_request_event') {
+          if (sidebarTabRef.current !== 'friends') {
+            setHasNewFriendRequest(true);
+            playNotifyTone('request');
+          }
+          void api.listFriends(token)
+            .then((social) => {
+              setFriendsData(social);
+              incomingRequestsRef.current = social.incoming.length;
+              friendsInitRef.current = true;
+            })
+            .catch(() => {
+              // best effort
+            });
+          return;
+        }
+        if (payload.type === 'friend_relationship_event') {
+          void refreshSocial();
+          return;
+        }
+        if (payload.type === 'dm_room_event') {
+          void api.listDMRooms(token)
+            .then((dms) => setDMRooms(dms))
+            .catch(() => {
+              // best effort
+            });
+        }
+      };
+
+      socket.onclose = () => {
+        if (stopped) return;
+        reconnectID = window.setTimeout(() => connect(), 1500);
+      };
+      socket.onerror = () => {
+        socket.close();
+      };
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      if (reconnectID !== null) {
+        window.clearTimeout(reconnectID);
+      }
+      eventsWsRef.current?.close();
+      eventsWsRef.current = null;
+    };
+  }, [token, user]);
+
+  useEffect(() => {
+    if (!token || !user) return;
     const roomIDs = Array.from(new Set([...rooms, ...dmRooms].map((room) => room.id)));
     if (roomIDs.length === 0) return;
     let mounted = true;
 
+    const checkRoomUnread = async (roomID: string) => {
+      try {
+        const latest = await api.listMessages(token, roomID, 1);
+        if (!mounted || latest.length === 0) return;
+        const message = latest[0];
+
+        setRoomActivityByID((prev) => {
+          const ts = new Date(message.created_at).getTime();
+          if ((prev[roomID] || 0) >= ts) return prev;
+          return { ...prev, [roomID]: ts };
+        });
+
+        setUnreadByRoom((prev) => {
+          const prevID = lastRoomMessageIDsRef.current[roomID];
+          lastRoomMessageIDsRef.current[roomID] = message.id;
+          const isActiveRoom = selectedRoomIDRef.current === roomID;
+          if (prevID && message.id !== prevID && message.user_id !== user.id && !isActiveRoom) {
+            return { ...prev, [roomID]: (prev[roomID] || 0) + 1 };
+          }
+          return prev;
+        });
+      } catch {
+        // best effort
+      }
+    };
+
     const pollUnread = async () => {
-      const latestByRoom = await Promise.all(
-        roomIDs.map(async (roomID) => {
-          try {
-            const latest = await api.listMessages(token, roomID, 1);
-            return { roomID, message: latest[0] };
-          } catch {
-            return { roomID, message: undefined };
-          }
-        }),
-      );
-      if (!mounted) return;
-
-      setRoomActivityByID((prev) => {
-        const next = { ...prev };
-        let changed = false;
-        for (const item of latestByRoom) {
-          if (!item.message) continue;
-          const ts = new Date(item.message.created_at).getTime();
-          if ((next[item.roomID] || 0) < ts) {
-            next[item.roomID] = ts;
-            changed = true;
-          }
-        }
-        return changed ? next : prev;
-      });
-
-      setUnreadByRoom((prev) => {
-        const next = { ...prev };
-        let changed = false;
-
-        for (const item of latestByRoom) {
-          if (!item.message) continue;
-          const prevID = lastRoomMessageIDsRef.current[item.roomID];
-          lastRoomMessageIDsRef.current[item.roomID] = item.message.id;
-          const isActiveRoom = selectedRoomIDRef.current === item.roomID;
-          if (prevID && item.message.id !== prevID && item.message.user_id !== user.id && !isActiveRoom) {
-            next[item.roomID] = (next[item.roomID] || 0) + 1;
-            changed = true;
-          }
-        }
-
-        return changed ? next : prev;
-      });
+      await Promise.all(roomIDs.map(async (roomID) => checkRoomUnread(roomID)));
     };
 
     void pollUnread();
-    const id = window.setInterval(() => void pollUnread(), 12000);
+    const id = window.setInterval(() => void pollUnread(), 30000);
     return () => {
       mounted = false;
       window.clearInterval(id);
     };
   }, [token, user, rooms, dmRooms]);
+
+  useEffect(() => {
+    if (!token) return;
+    const roomIDs = Array.from(new Set([...rooms, ...dmRooms].map((room) => room.id)));
+    if (roomIDs.length === 0) {
+      setActiveCallsByRoom({});
+      return;
+    }
+    let mounted = true;
+    const pollCalls = async () => {
+      const statuses = await Promise.all(
+        roomIDs.map(async (roomID) => {
+          try {
+            const callUsers = await api.listCallParticipants(token, roomID);
+            return [roomID, callUsers.length] as const;
+          } catch {
+            return [roomID, 0] as const;
+          }
+        }),
+      );
+      if (!mounted) return;
+      const next: Record<string, number> = {};
+      for (const [roomID, count] of statuses) {
+        next[roomID] = count;
+      }
+      setActiveCallsByRoom(next);
+    };
+    void pollCalls();
+    const id = window.setInterval(() => void pollCalls(), 8000);
+    return () => {
+      mounted = false;
+      window.clearInterval(id);
+    };
+  }, [token, rooms, dmRooms]);
 
   useEffect(() => {
     if (!token || !selectedRoom) return;
@@ -410,6 +554,7 @@ export function App() {
           try {
             const callUsers = await api.listCallParticipants(token, selectedRoom.id);
             if (!mounted) return;
+            setActiveCallsByRoom((prev) => ({ ...prev, [selectedRoom.id]: callUsers.length }));
             applyCallPresence(callUsers);
           } catch {
             // best effort
@@ -438,7 +583,7 @@ export function App() {
         const social = await api.listFriends(token);
         if (!mounted) return;
         setFriendsData(social);
-        if (friendsInitRef.current && social.incoming.length > incomingRequestsRef.current) {
+        if (friendsInitRef.current && social.incoming.length > incomingRequestsRef.current && sidebarTabRef.current !== 'friends') {
           playNotifyTone('request');
           setHasNewFriendRequest(true);
         }
@@ -449,7 +594,7 @@ export function App() {
       }
     };
     void tick();
-    const id = window.setInterval(() => void tick(), 15000);
+    const id = window.setInterval(() => void tick(), 5000);
     return () => {
       mounted = false;
       window.clearInterval(id);
@@ -469,6 +614,16 @@ export function App() {
   useEffect(() => {
     localStorage.setItem('talkie_join_with_mic', joinWithMicEnabled ? '1' : '0');
   }, [joinWithMicEnabled]);
+
+  useEffect(() => {
+    audioElsRef.current.forEach(({ participantID, source, el }) => {
+      const isScreen = isScreenAudioSource(source);
+      const v = isScreen
+        ? (participantScreenVolume[participantID] ?? 1)
+        : (participantVoiceVolume[participantID] ?? 0.65);
+      el.volume = clamp01(v);
+    });
+  }, [participantVoiceVolume, participantScreenVolume]);
 
   useEffect(() => {
     return () => {
@@ -510,7 +665,7 @@ export function App() {
   useEffect(() => {
     setInviteQuery('');
     setInviteResults([]);
-    setGeneratedInviteURL('');
+    setRoomMenuOpen(false);
   }, [selectedRoom?.id]);
 
   async function handleAuthSubmit(e: React.FormEvent) {
@@ -632,6 +787,9 @@ export function App() {
       setRooms((prev) => [room, ...prev]);
       setRoomActivityByID((prev) => ({ ...prev, [room.id]: new Date(room.created_at).getTime() }));
       setNewRoomName('');
+      setShowCreateRoomModal(false);
+      setSidebarTab('rooms');
+      await openRoom(room);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create room');
     }
@@ -649,6 +807,10 @@ export function App() {
     setUnreadByRoom((prev) => ({ ...prev, [room.id]: 0 }));
     callPresenceIDsRef.current = new Set();
 
+    if (roomWsReconnectRef.current !== null) {
+      window.clearTimeout(roomWsReconnectRef.current);
+      roomWsReconnectRef.current = null;
+    }
     wsRef.current?.close();
 
     try {
@@ -665,57 +827,76 @@ export function App() {
         setRoomActivityByID((prev) => ({ ...prev, [room.id]: new Date(room.created_at).getTime() }));
       }
 
-      const wsUrl = `${wsBaseUrl(api.apiBase)}/ws/rooms/${room.id}?token=${encodeURIComponent(token)}`;
-      const socket = new WebSocket(wsUrl);
+      const connectRoomSocket = () => {
+        const wsUrl = `${wsBaseUrl(api.apiBase)}/ws/rooms/${room.id}?token=${encodeURIComponent(token)}`;
+        const socket = new WebSocket(wsUrl);
 
-      socket.onmessage = (event) => {
-        const payload = JSON.parse(event.data) as {
-          type: string;
-          message?: Message;
-          messages?: Message[];
-          participants?: Participant[];
-          call_users?: Participant[];
+        socket.onmessage = (event) => {
+          const payload = JSON.parse(event.data) as {
+            type: string;
+            message?: Message;
+            messages?: Message[];
+            participants?: Participant[];
+            call_users?: Participant[];
+          };
+
+          if (payload.type === 'history' && payload.messages) {
+            setMessages(payload.messages);
+          }
+          if (payload.type === 'chat' && payload.message) {
+            const incomingMessage = payload.message;
+            setMessages((prev) => [...prev, incomingMessage]);
+            setRoomActivityByID((prev) => ({ ...prev, [room.id]: new Date(incomingMessage.created_at).getTime() }));
+            if (incomingMessage.user_id !== user?.id && selectedRoomIDRef.current !== room.id) {
+              playNotifyTone('message');
+              setUnreadByRoom((prev) => ({ ...prev, [room.id]: (prev[room.id] || 0) + 1 }));
+            }
+            lastRoomMessageIDsRef.current[room.id] = incomingMessage.id;
+          }
+          if (payload.type === 'participants' && payload.participants) {
+            setChatParticipants(payload.participants);
+          }
+          if (payload.type === 'call_participants') {
+            const callUsers = payload.call_users || [];
+            setActiveCallsByRoom((prev) => ({ ...prev, [room.id]: callUsers.length }));
+            const nextIDs = new Set(callUsers.map((u) => u.id));
+            const prevIDs = callPresenceIDsRef.current;
+            if (prevIDs.size > 0) {
+              for (const id of nextIDs) {
+                if (!prevIDs.has(id) && id !== user?.id) playPresenceTone('join');
+              }
+              for (const id of prevIDs) {
+                if (!nextIDs.has(id) && id !== user?.id) playPresenceTone('leave');
+              }
+            }
+            callPresenceIDsRef.current = nextIDs;
+            if (!inCall || callRoomIDRef.current !== room.id) {
+              applyCallPresence(callUsers);
+            }
+          }
         };
 
-        if (payload.type === 'history' && payload.messages) {
-          setMessages(payload.messages);
-        }
-        if (payload.type === 'chat' && payload.message) {
-          const incomingMessage = payload.message;
-          setMessages((prev) => [...prev, incomingMessage]);
-          setRoomActivityByID((prev) => ({ ...prev, [room.id]: new Date(incomingMessage.created_at).getTime() }));
-          if (incomingMessage.user_id !== user?.id && selectedRoomIDRef.current !== room.id) {
-            playNotifyTone('message');
-            setUnreadByRoom((prev) => ({ ...prev, [room.id]: (prev[room.id] || 0) + 1 }));
-          }
-          lastRoomMessageIDsRef.current[room.id] = incomingMessage.id;
-        }
-        if (payload.type === 'participants' && payload.participants) {
-          setChatParticipants(payload.participants);
-        }
-        if (payload.type === 'call_participants' && payload.call_users) {
-          const nextIDs = new Set(payload.call_users.map((u) => u.id));
-          const prevIDs = callPresenceIDsRef.current;
-          if (prevIDs.size > 0) {
-            for (const id of nextIDs) {
-              if (!prevIDs.has(id) && id !== user?.id) playPresenceTone('join');
+        socket.onclose = () => {
+          if (selectedRoomIDRef.current !== room.id) return;
+          roomWsReconnectRef.current = window.setTimeout(() => {
+            if (selectedRoomIDRef.current === room.id) {
+              connectRoomSocket();
             }
-            for (const id of prevIDs) {
-              if (!nextIDs.has(id) && id !== user?.id) playPresenceTone('leave');
-            }
-          }
-          callPresenceIDsRef.current = nextIDs;
-          if (!inCall || callRoomIDRef.current !== room.id) {
-            applyCallPresence(payload.call_users);
-          }
-        }
+          }, 1200);
+        };
+        socket.onerror = () => {
+          socket.close();
+        };
+
+        wsRef.current = socket;
       };
 
-      wsRef.current = socket;
+      connectRoomSocket();
 
       if (!inCall || callRoomIDRef.current !== room.id) {
         void api.listCallParticipants(token, room.id)
           .then((callUsers) => {
+            setActiveCallsByRoom((prev) => ({ ...prev, [room.id]: callUsers.length }));
             if (!inCall || callRoomIDRef.current !== room.id) {
               applyCallPresence(callUsers);
             }
@@ -760,6 +941,8 @@ export function App() {
       ...Array.from(room.remoteParticipants.values()).map((p) => {
         const camPub = p.getTrackPublication(Track.Source.Camera);
         const screenPub = p.getTrackPublication(Track.Source.ScreenShare);
+        const hasCamera = Boolean(camPub && !camPub.isMuted);
+        const hasScreen = Boolean(screenPub && !screenPub.isMuted);
         const camKey = camPub ? videoKey(p.identity, Track.Source.Camera, camPub.trackSid) : '';
         const screenKey = screenPub ? videoKey(p.identity, Track.Source.ScreenShare, screenPub.trackSid) : '';
 
@@ -767,10 +950,10 @@ export function App() {
           id: p.identity,
           username: p.name || p.identity,
           micEnabled: !p.isMicrophoneEnabled ? false : !p.getTrackPublication(Track.Source.Microphone)?.isMuted,
-          hasCamera: Boolean(camPub),
-          hasScreen: Boolean(screenPub),
-          watchingCamera: Boolean(camKey && watchedVideoKeys[camKey]),
-          watchingScreen: Boolean(screenKey && watchedVideoKeys[screenKey]),
+          hasCamera,
+          hasScreen,
+          watchingCamera: Boolean(hasCamera && camKey && watchedVideoKeys[camKey]),
+          watchingScreen: Boolean(hasScreen && screenKey && watchedVideoKeys[screenKey]),
         };
       }),
     ];
@@ -789,6 +972,25 @@ export function App() {
         watchingScreen: false,
       })),
     );
+  }
+
+  function getParticipantVolume(participantID: string, kind: 'voice' | 'screen'): number {
+    const map = kind === 'voice' ? participantVoiceVolume : participantScreenVolume;
+    const fallback = kind === 'voice' ? 0.65 : 1;
+    const fromState = map[participantID];
+    if (typeof fromState === 'number') return clamp01(fromState);
+    const fromStorage = Number(localStorage.getItem(volumeKey(kind, participantID)) || String(fallback));
+    return clamp01(fromStorage);
+  }
+
+  function setParticipantVolume(participantID: string, kind: 'voice' | 'screen', value: number) {
+    const next = clamp01(value);
+    localStorage.setItem(volumeKey(kind, participantID), String(next));
+    if (kind === 'voice') {
+      setParticipantVoiceVolume((prev) => ({ ...prev, [participantID]: next }));
+    } else {
+      setParticipantScreenVolume((prev) => ({ ...prev, [participantID]: next }));
+    }
   }
 
   function upsertVideoTile(nextTile: VideoTrackItem) {
@@ -973,10 +1175,9 @@ export function App() {
           const audioEl = track.attach() as HTMLAudioElement;
           audioEl.autoplay = true;
           audioEl.muted = deafenedRef.current;
-          const isScreenAudio = isScreenAudioSource(publication.source);
-          audioEl.volume = isScreenAudio
-            ? 1
-            : 0.65;
+          const isScreen = isScreenAudioSource(publication.source);
+          const v = getParticipantVolume(participant.identity, isScreen ? 'screen' : 'voice');
+          audioEl.volume = clamp01(v);
           audioElsRef.current.set(audioKey, { participantID: participant.identity, source: publication.source, el: audioEl });
         }
         syncCallParticipants(room);
@@ -1211,6 +1412,16 @@ export function App() {
     }
   }
 
+  function handleChatPaste(e: React.ClipboardEvent<HTMLInputElement>) {
+    const item = Array.from(e.clipboardData?.items || []).find((entry) => entry.type.startsWith('image/'));
+    if (!item) return;
+    const file = item.getAsFile();
+    if (!file) return;
+    e.preventDefault();
+    const name = file.name || `clipboard-${Date.now()}.png`;
+    setPendingImage(new File([file], name, { type: file.type || 'image/png' }));
+  }
+
   async function refreshSocial() {
     if (!token) return;
     try {
@@ -1267,14 +1478,45 @@ export function App() {
     }
   }
 
+  async function copyText(text: string): Promise<boolean> {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {
+        // Fallback to legacy copy flow below.
+      }
+    }
+    try {
+      const el = document.createElement('textarea');
+      el.value = text;
+      el.setAttribute('readonly', '');
+      el.style.position = 'fixed';
+      el.style.opacity = '0';
+      document.body.appendChild(el);
+      el.focus();
+      el.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(el);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
   async function generateInviteLink() {
     if (!token || !selectedRoom) return;
     setGeneratingInviteLink(true);
     setError(null);
     try {
       const result = await api.createInviteLink(token, selectedRoom.id);
-      setGeneratedInviteURL(result.invite_url);
-      await navigator.clipboard?.writeText(result.invite_url).catch(() => {});
+      const copied = await copyText(result.invite_url);
+      if (copied) {
+        setCopyNotice('Ссылка-приглашение в беседу скопирована.');
+      } else {
+        window.prompt('Скопируйте ссылку вручную:', result.invite_url);
+        setCopyNotice('Ссылка создана. Скопируйте ее вручную.');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create invite link');
     } finally {
@@ -1288,12 +1530,79 @@ export function App() {
     setError(null);
     try {
       const result = await api.createFriendInviteLink(token);
-      setFriendInviteURL(result.invite_url);
-      await navigator.clipboard?.writeText(result.invite_url).catch(() => {});
+      const copied = await copyText(result.invite_url);
+      if (copied) {
+        setCopyNotice('Ссылка для добавления в друзья скопирована.');
+      } else {
+        window.prompt('Скопируйте ссылку вручную:', result.invite_url);
+        setCopyNotice('Ссылка создана. Скопируйте ее вручную.');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create friend invite link');
     } finally {
       setCreatingFriendInvite(false);
+    }
+  }
+
+  async function handleRenameRoom() {
+    if (!token || !selectedRoom || selectedRoomIsDM || !selectedRoomCanManage) return;
+    const nextName = window.prompt('Новое название беседы', selectedRoom.name)?.trim();
+    if (!nextName || nextName === selectedRoom.name) return;
+    try {
+      const updated = await api.renameRoom(token, selectedRoom.id, nextName);
+      setRooms((prev) => prev.map((room) => (room.id === updated.id ? updated : room)));
+      setSelectedRoom(updated);
+      setRoomMenuOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to rename room');
+    }
+  }
+
+  async function handleDeleteRoom() {
+    if (!token || !selectedRoom || selectedRoomIsDM || !selectedRoomCanManage) return;
+    const ok = window.confirm(`Удалить беседу "${selectedRoom.name}" для всех участников?`);
+    if (!ok) return;
+    try {
+      await api.deleteRoom(token, selectedRoom.id);
+      if (activeCallRoomID === selectedRoom.id) {
+        await leaveCall();
+      }
+      setRooms((prev) => prev.filter((room) => room.id !== selectedRoom.id));
+      setUnreadByRoom((prev) => {
+        const out = { ...prev };
+        delete out[selectedRoom.id];
+        return out;
+      });
+      setMessages([]);
+      setChatParticipants([]);
+      setSelectedRoom(null);
+      setRoomMenuOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to delete room');
+    }
+  }
+
+  async function handleLeaveRoom() {
+    if (!token || !selectedRoom || selectedRoomIsDM) return;
+    const ok = window.confirm(`Выйти из беседы "${selectedRoom.name}"?`);
+    if (!ok) return;
+    try {
+      await api.leaveRoom(token, selectedRoom.id);
+      if (activeCallRoomID === selectedRoom.id) {
+        await leaveCall();
+      }
+      setRooms((prev) => prev.filter((room) => room.id !== selectedRoom.id));
+      setUnreadByRoom((prev) => {
+        const out = { ...prev };
+        delete out[selectedRoom.id];
+        return out;
+      });
+      setMessages([]);
+      setChatParticipants([]);
+      setSelectedRoom(null);
+      setRoomMenuOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to leave room');
     }
   }
 
@@ -1324,6 +1633,16 @@ export function App() {
     }
   }
 
+  async function declineFriend(requestID: number) {
+    if (!token) return;
+    try {
+      await api.declineFriendRequest(token, requestID);
+      await refreshSocial();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to decline friend');
+    }
+  }
+
   async function openDMWith(userID: string) {
     if (!token) return;
     try {
@@ -1337,7 +1656,12 @@ export function App() {
   }
 
   function logout() {
+    if (roomWsReconnectRef.current !== null) {
+      window.clearTimeout(roomWsReconnectRef.current);
+      roomWsReconnectRef.current = null;
+    }
     wsRef.current?.close();
+    eventsWsRef.current?.close();
     leaveCall();
     localStorage.removeItem('talkie_token');
     setToken(null);
@@ -1348,6 +1672,7 @@ export function App() {
     setCallParticipants([]);
     setDMRooms([]);
     setFriendsData({ friends: [], incoming: [] });
+    setActiveCallsByRoom({});
     setUserSearchResults([]);
     setSentFriendRequests({});
     setSidebarTab('rooms');
@@ -1360,7 +1685,7 @@ export function App() {
     setPendingImage(null);
     setMiniProfile(null);
     setLightboxImageURL(null);
-    setFriendInviteURL('');
+    setCopyNotice(null);
   }
 
   if (!token || !user) {
@@ -1491,14 +1816,27 @@ export function App() {
               <small>Голосовые комнаты</small>
             </div>
           )}
-          <button
-            className="sidebar-toggle"
-            type="button"
-            onClick={() => setSidebarCollapsed((prev) => !prev)}
-            title={sidebarCollapsed ? 'Развернуть боковую панель' : 'Свернуть боковую панель'}
-          >
-            {sidebarCollapsed ? '>>' : '<<'}
-          </button>
+          <div className="sidebar-header-actions">
+            <button
+              type="button"
+              className="create-room-plus"
+              onClick={() => {
+                setShowCreateRoomModal(true);
+                setSidebarTab('rooms');
+              }}
+              title="Создать комнату"
+            >
+              +
+            </button>
+            <button
+              className="sidebar-toggle"
+              type="button"
+              onClick={() => setSidebarCollapsed((prev) => !prev)}
+              title={sidebarCollapsed ? 'Развернуть боковую панель' : 'Свернуть боковую панель'}
+            >
+              {sidebarCollapsed ? '>>' : '<<'}
+            </button>
+          </div>
         </header>
 
         {!sidebarCollapsed ? (
@@ -1532,15 +1870,6 @@ export function App() {
 
               {sidebarTab === 'rooms' && (
                 <div className="rooms-panel">
-                  <form onSubmit={createRoom} className="new-room-form create-room-form">
-                    <input
-                      placeholder="Новая комната"
-                      value={newRoomName}
-                      onChange={(e) => setNewRoomName(e.target.value)}
-                    />
-                    <button type="submit">Создать</button>
-                  </form>
-
                   <ul className="room-list">
                     {sortedRooms.map((room) => (
                       <li key={room.id}>
@@ -1550,6 +1879,7 @@ export function App() {
                         >
                           <span className="room-hash">#</span>
                           <span className="room-name">{room.name}</span>
+                          {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
                           {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
                         </button>
                       </li>
@@ -1568,6 +1898,7 @@ export function App() {
                       >
                         <span className="room-hash">@</span>
                         <span className="room-name">{room.name}</span>
+                        {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
                         {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
                       </button>
                     </li>
@@ -1582,7 +1913,7 @@ export function App() {
                     <button type="button" onClick={generateFriendInviteLink} disabled={creatingFriendInvite}>
                       {creatingFriendInvite ? 'Создаем...' : 'Ссылка-приглашение'}
                     </button>
-                    {friendInviteURL && <small className="invite-link-preview">{friendInviteURL}</small>}
+                    {copyNotice && <small className="copy-notice">{copyNotice}</small>}
                   </div>
                   <form onSubmit={handleUserSearch} className="new-room-form">
                     <input
@@ -1616,6 +1947,7 @@ export function App() {
                         <li key={fr.id}>
                           <span className="participant-name">{fr.requester_username}</span>
                           <button type="button" onClick={() => acceptFriend(fr.id)}>Принять</button>
+                          <button type="button" className="ghost" onClick={() => declineFriend(fr.id)}>Отклонить</button>
                         </li>
                       ))}
                     </ul>
@@ -1687,6 +2019,24 @@ export function App() {
                   <h3>{selectedRoom.name}</h3>
                   <small>{inCall ? 'Подключено к голосовому каналу' : 'Звонок и чат комнаты'}</small>
                 </div>
+                {!selectedRoomIsDM && (
+                  <div className="room-menu-wrap">
+                    <button type="button" className="ghost room-menu-btn" onClick={() => setRoomMenuOpen((prev) => !prev)}>
+                      ...
+                    </button>
+                    {roomMenuOpen && (
+                      <div className="room-menu">
+                        {selectedRoomCanManage && (
+                          <>
+                            <button type="button" onClick={handleRenameRoom}>Переименовать беседу</button>
+                            <button type="button" className="danger" onClick={handleDeleteRoom}>Удалить беседу для всех</button>
+                          </>
+                        )}
+                        <button type="button" onClick={handleLeaveRoom}>Выйти из беседы</button>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="call-roster">
@@ -1705,10 +2055,11 @@ export function App() {
                         >
                           {p.username}
                         </button>
-                        <span className={`mic-badge ${p.micEnabled === null ? 'unknown' : (p.micEnabled ? '' : 'off')}`}>
-                          {p.micEnabled === null ? 'нет данных' : (p.micEnabled ? 'мик' : 'выкл')}
-                        </span>
-                        {activeSpeakerIDs.includes(p.id) && <em className="speaking-badge">говорит</em>}
+                        {p.micEnabled !== null && (
+                          <span className={`mic-badge ${p.micEnabled ? '' : 'off'}`}>
+                            {p.micEnabled ? 'мик' : 'выкл'}
+                          </span>
+                        )}
                         {p.id !== roomRef.current?.localParticipant.identity && p.hasCamera && (
                           <button
                             className={`stream-watch-btn ${p.watchingCamera ? '' : 'control-off'}`}
@@ -1726,6 +2077,32 @@ export function App() {
                           >
                             {p.watchingScreen ? 'Экран: вкл' : 'Экран: выкл'}
                           </button>
+                        )}
+                        {p.id !== roomRef.current?.localParticipant.identity && (
+                          <>
+                            <label className="participant-volume">
+                              Громк. голоса: {Math.round(getParticipantVolume(p.id, 'voice') * 100)}%
+                              <input
+                                type="range"
+                                min={0}
+                                max={100}
+                                step={1}
+                                value={Math.round(getParticipantVolume(p.id, 'voice') * 100)}
+                                onChange={(e) => setParticipantVolume(p.id, 'voice', Number(e.target.value) / 100)}
+                              />
+                            </label>
+                            <label className="participant-volume">
+                              Громк. демки: {Math.round(getParticipantVolume(p.id, 'screen') * 100)}%
+                              <input
+                                type="range"
+                                min={0}
+                                max={100}
+                                step={1}
+                                value={Math.round(getParticipantVolume(p.id, 'screen') * 100)}
+                                onChange={(e) => setParticipantVolume(p.id, 'screen', Number(e.target.value) / 100)}
+                              />
+                            </label>
+                          </>
                         )}
                       </li>
                     ))}
@@ -1859,6 +2236,7 @@ export function App() {
                   <input
                     value={chatInput}
                     onChange={(e) => setChatInput(e.target.value)}
+                    onPaste={handleChatPaste}
                     placeholder={pendingImage ? 'Подпись к изображению (необязательно)' : 'Напишите сообщение'}
                   />
                   <button type="submit">{pendingImage ? 'Отправить фото' : 'Отправить'}</button>
@@ -1876,9 +2254,7 @@ export function App() {
                       <button type="button" onClick={generateInviteLink} disabled={generatingInviteLink}>
                         {generatingInviteLink ? 'Создаем...' : 'Быстрая invite-ссылка'}
                       </button>
-                      {generatedInviteURL && (
-                        <small className="invite-link-preview">{generatedInviteURL}</small>
-                      )}
+                      {copyNotice && <small className="copy-notice">{copyNotice}</small>}
                     </>
                   )}
                   <form onSubmit={handleInviteSearch} className="invite-form">
@@ -1960,6 +2336,25 @@ export function App() {
               alt="Вложение в полном размере"
               onClick={(e) => e.stopPropagation()}
             />
+          </div>
+        )}
+        {showCreateRoomModal && (
+          <div className="mini-profile-overlay" onClick={() => setShowCreateRoomModal(false)} role="button" tabIndex={0}>
+            <form className="mini-profile-card create-room-modal" onSubmit={createRoom} onClick={(e) => e.stopPropagation()}>
+              <h4>Создать комнату</h4>
+              <label>
+                Название
+                <input
+                  value={newRoomName}
+                  onChange={(e) => setNewRoomName(e.target.value)}
+                  placeholder="Например, команда"
+                  required
+                  autoFocus
+                />
+              </label>
+              <button type="submit">Создать</button>
+              <button type="button" className="ghost" onClick={() => setShowCreateRoomModal(false)}>Отмена</button>
+            </form>
           </div>
         )}
       </main>

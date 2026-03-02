@@ -9,6 +9,7 @@ import (
 type Hub struct {
 	mu         sync.RWMutex
 	rooms      map[uuid.UUID]map[*Client]struct{}
+	userEvents map[uuid.UUID]map[*NotificationClient]struct{}
 	callCounts map[uuid.UUID]map[uuid.UUID]int
 	callUsers  map[uuid.UUID]map[uuid.UUID]Participant
 }
@@ -16,6 +17,7 @@ type Hub struct {
 func NewHub() *Hub {
 	return &Hub{
 		rooms:      make(map[uuid.UUID]map[*Client]struct{}),
+		userEvents: make(map[uuid.UUID]map[*NotificationClient]struct{}),
 		callCounts: make(map[uuid.UUID]map[uuid.UUID]int),
 		callUsers:  make(map[uuid.UUID]map[uuid.UUID]Participant),
 	}
@@ -47,6 +49,42 @@ func (h *Hub) Remove(c *Client) {
 func (h *Hub) Broadcast(roomID uuid.UUID, payload OutgoingMessage) {
 	h.mu.RLock()
 	clients := h.rooms[roomID]
+	h.mu.RUnlock()
+
+	for c := range clients {
+		select {
+		case c.Send <- payload:
+		default:
+			c.Close()
+		}
+	}
+}
+
+func (h *Hub) AddUserEvents(c *NotificationClient) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.userEvents[c.UserID]; !ok {
+		h.userEvents[c.UserID] = make(map[*NotificationClient]struct{})
+	}
+	h.userEvents[c.UserID][c] = struct{}{}
+}
+
+func (h *Hub) RemoveUserEvents(c *NotificationClient) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	clients, ok := h.userEvents[c.UserID]
+	if !ok {
+		return
+	}
+	delete(clients, c)
+	if len(clients) == 0 {
+		delete(h.userEvents, c.UserID)
+	}
+}
+
+func (h *Hub) BroadcastUser(userID uuid.UUID, payload OutgoingMessage) {
+	h.mu.RLock()
+	clients := h.userEvents[userID]
 	h.mu.RUnlock()
 
 	for c := range clients {

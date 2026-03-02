@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"context"
+	"log"
 	"net/http"
 	"time"
 
@@ -96,4 +98,57 @@ func (s *Server) roomWebSocket(w http.ResponseWriter, r *http.Request) {
 	go c.ReadPump()
 
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+}
+
+func (s *Server) eventsWebSocket(w http.ResponseWriter, r *http.Request) {
+	tokenString := r.URL.Query().Get("token")
+	if tokenString == "" {
+		jsonError(w, http.StatusUnauthorized, "missing token")
+		return
+	}
+	claims, err := auth.ParseJWT(s.Cfg.JWTSecret, tokenString)
+	if err != nil {
+		jsonError(w, http.StatusUnauthorized, "invalid token")
+		return
+	}
+	userID, err := uuid.Parse(claims.UserID)
+	if err != nil {
+		jsonError(w, http.StatusUnauthorized, "invalid token payload")
+		return
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+
+	c := &ws.NotificationClient{
+		Conn:   conn,
+		Hub:    s.Hub,
+		UserID: userID,
+		Send:   make(chan ws.OutgoingMessage, 64),
+	}
+	s.Hub.AddUserEvents(c)
+
+	go c.WritePump()
+	go c.ReadPump()
+
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+}
+
+func (s *Server) broadcastRoomMessageEvent(ctx context.Context, roomID, senderID uuid.UUID, payload ws.MessagePayload) {
+	members, err := s.Store.ListRoomMembers(ctx, roomID)
+	if err != nil {
+		log.Printf("list members for room event failed: %v", err)
+		return
+	}
+	for _, m := range members {
+		if m.ID == senderID {
+			continue
+		}
+		s.Hub.BroadcastUser(m.ID, ws.OutgoingMessage{
+			Type:    "room_message_event",
+			Message: &payload,
+		})
+	}
 }

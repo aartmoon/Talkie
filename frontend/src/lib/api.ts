@@ -93,6 +93,12 @@ export const api = {
     request<Room>(`/api/invite-links/${encodeURIComponent(inviteToken)}/join`, { method: 'POST' }, token),
   joinRoom: (token: string, roomID: string) =>
     request<{ joined: boolean }>(`/api/rooms/${roomID}/join`, { method: 'POST' }, token),
+  renameRoom: (token: string, roomID: string, name: string) =>
+    request<Room>(`/api/rooms/${roomID}`, { method: 'PATCH', body: JSON.stringify({ name }) }, token),
+  deleteRoom: (token: string, roomID: string) =>
+    request<{ ok: boolean }>(`/api/rooms/${roomID}`, { method: 'DELETE' }, token),
+  leaveRoom: (token: string, roomID: string) =>
+    request<{ ok: boolean }>(`/api/rooms/${roomID}/leave`, { method: 'POST' }, token),
   listMessages: (token: string, roomID: string, limit = 50) =>
     request<Message[]>(`/api/rooms/${roomID}/messages?limit=${limit}`, {}, token),
   listCallParticipants: (token: string, roomID: string) =>
@@ -120,6 +126,8 @@ export const api = {
     ),
   acceptFriendRequest: (token: string, requestID: number) =>
     request<{ ok: boolean }>(`/api/friends/requests/${requestID}/accept`, { method: 'POST' }, token),
+  declineFriendRequest: (token: string, requestID: number) =>
+    request<{ ok: boolean }>(`/api/friends/requests/${requestID}/decline`, { method: 'POST' }, token),
   createFriendInviteLink: (token: string) =>
     request<InviteLinkResult>('/api/friends/invite-link', { method: 'POST' }, token),
   acceptFriendInviteLink: (token: string, inviteToken: string) =>

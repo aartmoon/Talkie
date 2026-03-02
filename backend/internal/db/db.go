@@ -32,6 +32,8 @@ type Room struct {
 	Name      string    `json:"name"`
 	CreatedBy uuid.UUID `json:"created_by"`
 	IsPrivate bool      `json:"is_private"`
+	MyRole    string    `json:"my_role,omitempty"`
+	CanManage bool      `json:"can_manage,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -153,15 +155,17 @@ func (s *Store) CreateRoom(ctx context.Context, name string, createdBy uuid.UUID
 	if err != nil {
 		return Room{}, err
 	}
-	if _, err := s.DB.ExecContext(ctx, `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, r.ID, createdBy); err != nil {
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO room_members (room_id, user_id, role) VALUES ($1, $2, 'admin') ON CONFLICT DO NOTHING`, r.ID, createdBy); err != nil {
 		return Room{}, err
 	}
+	r.MyRole = "admin"
+	r.CanManage = true
 	return r, nil
 }
 
 func (s *Store) ListRoomsForUser(ctx context.Context, userID uuid.UUID) ([]Room, error) {
 	query := `
-		SELECT DISTINCT r.id, r.name, r.created_by, r.is_private, r.created_at
+		SELECT DISTINCT r.id, r.name, r.created_by, r.is_private, rm.role, (rm.role = 'admin') AS can_manage, r.created_at
 		FROM rooms r
 		JOIN room_members rm ON rm.room_id = r.id
 		LEFT JOIN direct_rooms d ON d.room_id = r.id
@@ -178,7 +182,7 @@ func (s *Store) ListRoomsForUser(ctx context.Context, userID uuid.UUID) ([]Room,
 	rooms := []Room{}
 	for rows.Next() {
 		var r Room
-		if err := rows.Scan(&r.ID, &r.Name, &r.CreatedBy, &r.IsPrivate, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.CreatedBy, &r.IsPrivate, &r.MyRole, &r.CanManage, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		rooms = append(rooms, r)
@@ -187,7 +191,7 @@ func (s *Store) ListRoomsForUser(ctx context.Context, userID uuid.UUID) ([]Room,
 }
 
 func (s *Store) JoinRoom(ctx context.Context, roomID, userID uuid.UUID) error {
-	query := `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`
+	query := `INSERT INTO room_members (room_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING`
 	_, err := s.DB.ExecContext(ctx, query, roomID, userID)
 	return err
 }
@@ -221,6 +225,106 @@ func (s *Store) IsRoomMember(ctx context.Context, roomID, userID uuid.UUID) (boo
 	var exists bool
 	err := s.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2)`, roomID, userID).Scan(&exists)
 	return exists, err
+}
+
+func (s *Store) IsRoomAdmin(ctx context.Context, roomID, userID uuid.UUID) (bool, error) {
+	var isAdmin bool
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM room_members
+			WHERE room_id = $1 AND user_id = $2 AND role = 'admin'
+		)
+	`, roomID, userID).Scan(&isAdmin)
+	return isAdmin, err
+}
+
+func (s *Store) GetRoomForUser(ctx context.Context, roomID, userID uuid.UUID) (Room, error) {
+	var r Room
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT r.id, r.name, r.created_by, r.is_private, rm.role, (rm.role = 'admin') AS can_manage, r.created_at
+		FROM rooms r
+		JOIN room_members rm ON rm.room_id = r.id
+		WHERE r.id = $1 AND rm.user_id = $2
+	`, roomID, userID).Scan(&r.ID, &r.Name, &r.CreatedBy, &r.IsPrivate, &r.MyRole, &r.CanManage, &r.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Room{}, ErrNotFound
+		}
+		return Room{}, err
+	}
+	return r, nil
+}
+
+func (s *Store) UpdateRoomName(ctx context.Context, roomID uuid.UUID, name string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE rooms SET name = $2 WHERE id = $1`, roomID, name)
+	return err
+}
+
+func (s *Store) DeleteRoom(ctx context.Context, roomID uuid.UUID) error {
+	_, err := s.DB.ExecContext(ctx, `DELETE FROM rooms WHERE id = $1`, roomID)
+	return err
+}
+
+func (s *Store) LeaveRoom(ctx context.Context, roomID, userID uuid.UUID) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var role string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT role
+		FROM room_members
+		WHERE room_id = $1 AND user_id = $2
+		FOR UPDATE
+	`, roomID, userID).Scan(&role); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM room_members WHERE room_id = $1 AND user_id = $2`, roomID, userID); err != nil {
+		return err
+	}
+
+	var membersLeft int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM room_members WHERE room_id = $1`, roomID).Scan(&membersLeft); err != nil {
+		return err
+	}
+	if membersLeft == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM rooms WHERE id = $1`, roomID); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	if role == "admin" {
+		var adminsLeft int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM room_members WHERE room_id = $1 AND role = 'admin'`, roomID).Scan(&adminsLeft); err != nil {
+			return err
+		}
+		if adminsLeft == 0 {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE room_members
+				SET role = 'admin'
+				WHERE room_id = $1
+				  AND user_id = (
+					SELECT user_id
+					FROM room_members
+					WHERE room_id = $1
+					ORDER BY joined_at ASC
+					LIMIT 1
+				  )
+			`, roomID); err != nil {
+				return err
+			}
+		}
+	}
+
+	return tx.Commit()
 }
 
 func (s *Store) IsDirectRoom(ctx context.Context, roomID uuid.UUID) (bool, error) {
@@ -340,12 +444,24 @@ func (s *Store) CreateFriendRequest(ctx context.Context, requesterID, addresseeI
 	if exists {
 		return nil
 	}
-	_, err := s.DB.ExecContext(ctx, `
+	var reqID int64
+	err := s.DB.QueryRowContext(ctx, `
 		INSERT INTO friend_requests (requester_id, addressee_id, status)
 		VALUES ($1, $2, 'pending')
-		ON CONFLICT (requester_id, addressee_id) DO UPDATE SET status = 'pending'
-	`, requesterID, addresseeID)
-	return err
+		ON CONFLICT (requester_id, addressee_id) DO UPDATE
+		SET status = 'pending',
+		    created_at = NOW()
+		WHERE friend_requests.status <> 'rejected'
+		   OR friend_requests.created_at <= NOW() - INTERVAL '24 hours'
+		RETURNING id
+	`, requesterID, addresseeID).Scan(&reqID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("friend request cooldown is active for 24 hours")
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) AcceptFriendRequest(ctx context.Context, reqID int64, userID uuid.UUID) error {
@@ -381,6 +497,38 @@ func (s *Store) AcceptFriendRequest(ctx context.Context, reqID int64, userID uui
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO friendships (user_id, friend_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, addresseeID, requesterID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) DeclineFriendRequest(ctx context.Context, reqID int64, userID uuid.UUID) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var addresseeID uuid.UUID
+	var status string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT addressee_id, status
+		FROM friend_requests
+		WHERE id = $1
+		FOR UPDATE
+	`, reqID).Scan(&addresseeID, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if addresseeID != userID {
+		return ErrNotFound
+	}
+	if status != "pending" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE friend_requests SET status = 'rejected', created_at = NOW() WHERE id = $1`, reqID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -426,10 +574,10 @@ func (s *Store) GetOrCreateDirectRoom(ctx context.Context, a, b uuid.UUID) (Room
 	`, r.ID, userA, userB); err != nil {
 		return Room{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, r.ID, userA); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO room_members (room_id, user_id, role) VALUES ($1, $2, 'admin') ON CONFLICT DO NOTHING`, r.ID, userA); err != nil {
 		return Room{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, r.ID, userB); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO room_members (room_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING`, r.ID, userB); err != nil {
 		return Room{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -442,9 +590,10 @@ func (s *Store) ListDirectRoomsForUser(ctx context.Context, userID uuid.UUID) ([
 	query := `
 		SELECT r.id,
 		       CASE WHEN d.user_a = $1 THEN ub.username ELSE ua.username END AS dm_name,
-		       r.created_by, r.is_private, r.created_at
+		       r.created_by, r.is_private, rm.role, (rm.role = 'admin') AS can_manage, r.created_at
 		FROM rooms r
 		JOIN direct_rooms d ON d.room_id = r.id
+		JOIN room_members rm ON rm.room_id = r.id AND rm.user_id = $1
 		JOIN users ua ON ua.id = d.user_a
 		JOIN users ub ON ub.id = d.user_b
 		WHERE d.user_a = $1 OR d.user_b = $1
@@ -458,7 +607,7 @@ func (s *Store) ListDirectRoomsForUser(ctx context.Context, userID uuid.UUID) ([
 	out := make([]Room, 0)
 	for rows.Next() {
 		var r Room
-		if err := rows.Scan(&r.ID, &r.Name, &r.CreatedBy, &r.IsPrivate, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.CreatedBy, &r.IsPrivate, &r.MyRole, &r.CanManage, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -591,11 +740,32 @@ func (s *Store) ResetPasswordByTokenHash(ctx context.Context, tokenHash, passwor
 	return nil
 }
 
-func (s *Store) CreateRoomInviteLink(ctx context.Context, tokenHash string, roomID, createdBy uuid.UUID, expiresAt time.Time) error {
+func (s *Store) FindRoomInviteLinkByCreator(ctx context.Context, roomID, createdBy uuid.UUID) (string, time.Time, error) {
+	var token string
+	var expiresAt time.Time
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT token, expires_at
+		FROM room_invite_links
+		WHERE room_id = $1
+		  AND created_by = $2
+		  AND token IS NOT NULL
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, roomID, createdBy).Scan(&token, &expiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", time.Time{}, ErrNotFound
+		}
+		return "", time.Time{}, err
+	}
+	return token, expiresAt, nil
+}
+
+func (s *Store) CreateRoomInviteLink(ctx context.Context, rawToken, tokenHash string, roomID, createdBy uuid.UUID, expiresAt time.Time) error {
 	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO room_invite_links (token_hash, room_id, created_by, expires_at)
-		VALUES ($1, $2, $3, $4)
-	`, tokenHash, roomID, createdBy, expiresAt)
+		INSERT INTO room_invite_links (token, token_hash, room_id, created_by, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, rawToken, tokenHash, roomID, createdBy, expiresAt)
 	return err
 }
 
@@ -619,11 +789,31 @@ func (s *Store) JoinRoomByInviteTokenHash(ctx context.Context, tokenHash string,
 	return roomID, nil
 }
 
-func (s *Store) CreateFriendInviteLink(ctx context.Context, tokenHash string, createdBy uuid.UUID, expiresAt time.Time) error {
+func (s *Store) FindFriendInviteLinkByCreator(ctx context.Context, createdBy uuid.UUID) (string, time.Time, error) {
+	var token string
+	var expiresAt time.Time
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT token, expires_at
+		FROM friend_invite_links
+		WHERE created_by = $1
+		  AND token IS NOT NULL
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, createdBy).Scan(&token, &expiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", time.Time{}, ErrNotFound
+		}
+		return "", time.Time{}, err
+	}
+	return token, expiresAt, nil
+}
+
+func (s *Store) CreateFriendInviteLink(ctx context.Context, rawToken, tokenHash string, createdBy uuid.UUID, expiresAt time.Time) error {
 	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO friend_invite_links (token_hash, created_by, expires_at)
-		VALUES ($1, $2, $3)
-	`, tokenHash, createdBy, expiresAt)
+		INSERT INTO friend_invite_links (token, token_hash, created_by, expires_at)
+		VALUES ($1, $2, $3, $4)
+	`, rawToken, tokenHash, createdBy, expiresAt)
 	return err
 }
 

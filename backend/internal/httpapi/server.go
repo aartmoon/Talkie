@@ -57,6 +57,9 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/rooms", s.listRooms)
 			r.Post("/rooms", s.createRoom)
 			r.Post("/rooms/{roomID}/join", s.joinRoom)
+			r.Patch("/rooms/{roomID}", s.renameRoom)
+			r.Delete("/rooms/{roomID}", s.deleteRoom)
+			r.Post("/rooms/{roomID}/leave", s.leaveRoom)
 			r.Post("/rooms/{roomID}/invite", s.inviteToRoom)
 			r.Post("/rooms/{roomID}/invite-link", s.createRoomInviteLink)
 			r.Get("/rooms/{roomID}/messages", s.listMessages)
@@ -65,10 +68,11 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/rooms/{roomID}/livekit-token", s.liveKitToken)
 			r.Get("/users/search", s.searchUsers)
 			r.Get("/friends", s.listFriends)
-			r.Post("/friends/requests", s.sendFriendRequest)
-			r.Post("/friends/requests/{requestID}/accept", s.acceptFriendRequest)
-			r.Post("/friends/invite-link", s.createFriendInviteLink)
-			r.Post("/friends/invite-links/{token}/accept", s.acceptFriendInviteLink)
+				r.Post("/friends/requests", s.sendFriendRequest)
+				r.Post("/friends/requests/{requestID}/accept", s.acceptFriendRequest)
+				r.Post("/friends/requests/{requestID}/decline", s.declineFriendRequest)
+				r.Post("/friends/invite-link", s.createFriendInviteLink)
+				r.Post("/friends/invite-links/{token}/accept", s.acceptFriendInviteLink)
 			r.Get("/dm/rooms", s.listDMRooms)
 			r.Post("/dm/rooms", s.createOrGetDMRoom)
 			r.Post("/invite-links/{token}/join", s.joinByInviteLink)
@@ -76,6 +80,7 @@ func (s *Server) Routes() http.Handler {
 	})
 
 	r.Get("/ws/rooms/{roomID}", s.roomWebSocket)
+	r.Get("/ws/events", s.eventsWebSocket)
 
 	return r
 }
@@ -451,13 +456,25 @@ func (s *Server) createRoomInviteLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if token, expiresAt, err := s.Store.FindRoomInviteLinkByCreator(r.Context(), roomID, user.ID); err == nil {
+		jsonResponse(w, http.StatusOK, map[string]string{
+			"token":      token,
+			"invite_url": fmt.Sprintf("%s?invite=%s", strings.TrimRight(s.Cfg.FrontendBaseURL, "/"), token),
+			"expires_at": expiresAt.Format(time.RFC3339),
+		})
+		return
+	} else if err != db.ErrNotFound {
+		jsonError(w, http.StatusInternalServerError, "failed to load invite link")
+		return
+	}
+
 	rawToken, err := randomToken(24)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "failed to create invite link")
 		return
 	}
-	expiresAt := time.Now().UTC().Add(24 * time.Hour)
-	if err := s.Store.CreateRoomInviteLink(r.Context(), tokenHash(rawToken), roomID, user.ID, expiresAt); err != nil {
+	expiresAt := time.Now().UTC().Add(10 * 365 * 24 * time.Hour)
+	if err := s.Store.CreateRoomInviteLink(r.Context(), rawToken, tokenHash(rawToken), roomID, user.ID, expiresAt); err != nil {
 		jsonError(w, http.StatusInternalServerError, "failed to store invite link")
 		return
 	}
@@ -524,6 +541,166 @@ func (s *Server) joinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]bool{"joined": true})
+}
+
+func (s *Server) renameRoom(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	roomID, err := uuid.Parse(chi.URLParam(r, "roomID"))
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid room id")
+		return
+	}
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
+		jsonError(w, http.StatusNotFound, "room not found")
+		return
+	}
+	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !member {
+		jsonError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	direct, err := s.Store.IsDirectRoom(r.Context(), roomID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check room type")
+		return
+	}
+	if direct {
+		jsonError(w, http.StatusBadRequest, "cannot rename direct messages")
+		return
+	}
+	admin, err := s.Store.IsRoomAdmin(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check room role")
+		return
+	}
+	if !admin {
+		jsonError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		jsonError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if err := s.Store.UpdateRoomName(r.Context(), roomID, req.Name); err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to rename room")
+		return
+	}
+	room, err := s.Store.GetRoomForUser(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to load room")
+		return
+	}
+	jsonResponse(w, http.StatusOK, room)
+}
+
+func (s *Server) deleteRoom(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	roomID, err := uuid.Parse(chi.URLParam(r, "roomID"))
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid room id")
+		return
+	}
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
+		jsonError(w, http.StatusNotFound, "room not found")
+		return
+	}
+	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !member {
+		jsonError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	direct, err := s.Store.IsDirectRoom(r.Context(), roomID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check room type")
+		return
+	}
+	if direct {
+		jsonError(w, http.StatusBadRequest, "cannot delete direct messages")
+		return
+	}
+	admin, err := s.Store.IsRoomAdmin(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check room role")
+		return
+	}
+	if !admin {
+		jsonError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if err := s.Store.DeleteRoom(r.Context(), roomID); err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to delete room")
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) leaveRoom(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	roomID, err := uuid.Parse(chi.URLParam(r, "roomID"))
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid room id")
+		return
+	}
+	if _, err := s.Store.GetRoomByID(r.Context(), roomID); err != nil {
+		jsonError(w, http.StatusNotFound, "room not found")
+		return
+	}
+	member, err := s.Store.IsRoomMember(r.Context(), roomID, user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !member {
+		jsonError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	direct, err := s.Store.IsDirectRoom(r.Context(), roomID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to check room type")
+		return
+	}
+	if direct {
+		jsonError(w, http.StatusBadRequest, "cannot leave direct messages")
+		return
+	}
+	if err := s.Store.LeaveRoom(r.Context(), roomID, user.ID); err != nil {
+		if err == db.ErrNotFound {
+			jsonError(w, http.StatusNotFound, "membership not found")
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "failed to leave room")
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
@@ -700,6 +877,7 @@ func (s *Server) sendFriendRequest(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.Hub.BroadcastUser(targetID, ws.OutgoingMessage{Type: "friend_request_event"})
 	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -722,6 +900,31 @@ func (s *Server) acceptFriendRequest(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "failed to accept request")
 		return
 	}
+	s.Hub.BroadcastUser(user.ID, ws.OutgoingMessage{Type: "friend_relationship_event"})
+	s.Hub.BroadcastUser(user.ID, ws.OutgoingMessage{Type: "friend_request_event"})
+	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) declineFriendRequest(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	requestID, err := strconv.ParseInt(chi.URLParam(r, "requestID"), 10, 64)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request id")
+		return
+	}
+	if err := s.Store.DeclineFriendRequest(r.Context(), requestID, user.ID); err != nil {
+		if err == db.ErrNotFound {
+			jsonError(w, http.StatusNotFound, "request not found")
+			return
+		}
+		jsonError(w, http.StatusBadRequest, "failed to decline request")
+		return
+	}
+	s.Hub.BroadcastUser(user.ID, ws.OutgoingMessage{Type: "friend_request_event"})
 	jsonResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -731,13 +934,25 @@ func (s *Server) createFriendInviteLink(w http.ResponseWriter, r *http.Request) 
 		jsonError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	if token, expiresAt, err := s.Store.FindFriendInviteLinkByCreator(r.Context(), user.ID); err == nil {
+		jsonResponse(w, http.StatusOK, map[string]string{
+			"token":      token,
+			"invite_url": fmt.Sprintf("%s?friend_invite=%s", strings.TrimRight(s.Cfg.FrontendBaseURL, "/"), token),
+			"expires_at": expiresAt.Format(time.RFC3339),
+		})
+		return
+	} else if err != db.ErrNotFound {
+		jsonError(w, http.StatusInternalServerError, "failed to load friend invite link")
+		return
+	}
+
 	rawToken, err := randomToken(24)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "failed to create invite token")
 		return
 	}
-	expiresAt := time.Now().UTC().Add(48 * time.Hour)
-	if err := s.Store.CreateFriendInviteLink(r.Context(), tokenHash(rawToken), user.ID, expiresAt); err != nil {
+	expiresAt := time.Now().UTC().Add(10 * 365 * 24 * time.Hour)
+	if err := s.Store.CreateFriendInviteLink(r.Context(), rawToken, tokenHash(rawToken), user.ID, expiresAt); err != nil {
 		jsonError(w, http.StatusInternalServerError, "failed to store friend invite link")
 		return
 	}
@@ -768,6 +983,8 @@ func (s *Server) acceptFriendInviteLink(w http.ResponseWriter, r *http.Request) 
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.Hub.BroadcastUser(user.ID, ws.OutgoingMessage{Type: "friend_relationship_event"})
+	s.Hub.BroadcastUser(friend.ID, ws.OutgoingMessage{Type: "friend_relationship_event"})
 	jsonResponse(w, http.StatusOK, friend)
 }
 
@@ -808,6 +1025,7 @@ func (s *Server) createOrGetDMRoom(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "failed to open dm")
 		return
 	}
+	s.Hub.BroadcastUser(targetID, ws.OutgoingMessage{Type: "dm_room_event"})
 	targetUser, err := s.Store.FindUserByID(r.Context(), targetID)
 	if err == nil {
 		room.Name = targetUser.Username
