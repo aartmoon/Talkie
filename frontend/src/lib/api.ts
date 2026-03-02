@@ -1,4 +1,4 @@
-import type { Friend, FriendsResponse, Message, Participant, Room, User } from './types';
+import type { Friend, FriendsResponse, Message, Participant, Room, RoomGroup, User, UserProfile } from './types';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 
@@ -115,8 +115,17 @@ export const api = {
       { method: 'POST' },
       token,
     ),
+  listGroups: (token: string) => request<RoomGroup[]>('/api/groups', {}, token),
+  createGroup: (token: string, name: string) =>
+    request<RoomGroup>('/api/groups', { method: 'POST', body: JSON.stringify({ name }) }, token),
+  renameGroup: (token: string, groupID: string, name: string) =>
+    request<{ ok: boolean }>(`/api/groups/${groupID}`, { method: 'PATCH', body: JSON.stringify({ name }) }, token),
+  createGroupChannel: (token: string, groupID: string, name: string, type: 'text' | 'voice') =>
+    request<Room>(`/api/groups/${groupID}/channels`, { method: 'POST', body: JSON.stringify({ name, type }) }, token),
   searchUsers: (token: string, q: string) =>
     request<Friend[]>(`/api/users/search?q=${encodeURIComponent(q)}`, {}, token),
+  userProfile: (token: string, userID: string) =>
+    request<UserProfile>(`/api/users/${encodeURIComponent(userID)}/profile`, {}, token),
   listFriends: (token: string) => request<FriendsResponse>('/api/friends', {}, token),
   sendFriendRequest: (token: string, userID: string) =>
     request<{ ok: boolean }>(

@@ -38,6 +38,39 @@ func (s *Server) listFriends(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) userProfile(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	targetID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	u, err := s.Store.FindUserByID(r.Context(), targetID)
+	if err != nil {
+		if err == db.ErrNotFound {
+			jsonError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "failed to load user profile")
+		return
+	}
+	isFriend, err := s.Store.IsFriend(r.Context(), user.ID, targetID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to load relationship")
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"id":         u.ID,
+		"username":   u.Username,
+		"created_at": u.CreatedAt,
+		"is_friend":  isFriend,
+	})
+}
+
 func (s *Server) sendFriendRequest(w http.ResponseWriter, r *http.Request) {
 	user, ok := middleware.UserFromContext(r.Context())
 	if !ok {

@@ -13,6 +13,7 @@ import (
 )
 
 var ErrNotFound = errors.New("not found")
+var ErrForbidden = errors.New("forbidden")
 
 type Store struct {
 	DB *sql.DB
@@ -32,9 +33,34 @@ type Room struct {
 	Name      string    `json:"name"`
 	CreatedBy uuid.UUID `json:"created_by"`
 	IsPrivate bool      `json:"is_private"`
+	ChannelType string  `json:"channel_type,omitempty"`
+	GroupID   uuid.UUID `json:"group_id,omitempty"`
+	Position  int       `json:"position,omitempty"`
 	MyRole    string    `json:"my_role,omitempty"`
 	CanManage bool      `json:"can_manage,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type GroupChannel struct {
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	ChannelType string    `json:"channel_type"`
+	Position    int       `json:"position"`
+	CreatedBy   uuid.UUID `json:"created_by"`
+	IsPrivate   bool      `json:"is_private"`
+	MyRole      string    `json:"my_role,omitempty"`
+	CanManage   bool      `json:"can_manage,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type RoomGroup struct {
+	ID            uuid.UUID      `json:"id"`
+	Name          string         `json:"name"`
+	CreatedBy     uuid.UUID      `json:"created_by"`
+	CanManage     bool           `json:"can_manage"`
+	CreatedAt     time.Time      `json:"created_at"`
+	TextChannels  []GroupChannel `json:"text_channels"`
+	VoiceChannels []GroupChannel `json:"voice_channels"`
 }
 
 type Friend struct {
@@ -188,6 +214,244 @@ func (s *Store) ListRoomsForUser(ctx context.Context, userID uuid.UUID) ([]Room,
 		rooms = append(rooms, r)
 	}
 	return rooms, rows.Err()
+}
+
+func (s *Store) ListRoomGroupsForUser(ctx context.Context, userID uuid.UUID) ([]RoomGroup, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT g.id,
+		       g.name,
+		       g.created_by,
+		       g.created_at,
+		       (g.created_by = $1 OR EXISTS(
+		         SELECT 1
+		         FROM group_channels gcx
+		         JOIN room_members rmx ON rmx.room_id = gcx.room_id
+		         WHERE gcx.group_id = g.id
+		           AND rmx.user_id = $1
+		           AND rmx.role = 'admin'
+		       )) AS group_can_manage,
+		       r.id,
+		       r.name,
+		       gc.channel_type,
+		       gc.position,
+		       r.created_by,
+		       r.is_private,
+		       rm.role,
+		       (rm.role = 'admin') AS room_can_manage,
+		       r.created_at
+		FROM room_groups g
+		JOIN group_channels gc ON gc.group_id = g.id
+		JOIN rooms r ON r.id = gc.room_id
+		JOIN room_members rm ON rm.room_id = r.id AND rm.user_id = $1
+		LEFT JOIN direct_rooms d ON d.room_id = r.id
+		WHERE d.room_id IS NULL
+		ORDER BY g.created_at ASC, g.name ASC, gc.channel_type ASC, gc.position ASC, r.created_at ASC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	byID := make(map[uuid.UUID]*RoomGroup)
+	order := make([]uuid.UUID, 0)
+
+	for rows.Next() {
+		var (
+			groupID        uuid.UUID
+			groupName      string
+			groupCreatedBy uuid.UUID
+			groupCreatedAt time.Time
+			groupCanManage bool
+
+			roomID        uuid.UUID
+			roomName      string
+			channelType   string
+			position      int
+			roomCreatedBy uuid.UUID
+			isPrivate     bool
+			myRole        string
+			roomCanManage bool
+			roomCreatedAt time.Time
+		)
+		if err := rows.Scan(
+			&groupID,
+			&groupName,
+			&groupCreatedBy,
+			&groupCreatedAt,
+			&groupCanManage,
+			&roomID,
+			&roomName,
+			&channelType,
+			&position,
+			&roomCreatedBy,
+			&isPrivate,
+			&myRole,
+			&roomCanManage,
+			&roomCreatedAt,
+		); err != nil {
+			return nil, err
+		}
+
+		group := byID[groupID]
+		if group == nil {
+			group = &RoomGroup{
+				ID:            groupID,
+				Name:          groupName,
+				CreatedBy:     groupCreatedBy,
+				CanManage:     groupCanManage,
+				CreatedAt:     groupCreatedAt,
+				TextChannels:  make([]GroupChannel, 0),
+				VoiceChannels: make([]GroupChannel, 0),
+			}
+			byID[groupID] = group
+			order = append(order, groupID)
+		}
+
+		channel := GroupChannel{
+			ID:          roomID,
+			Name:        roomName,
+			ChannelType: channelType,
+			Position:    position,
+			CreatedBy:   roomCreatedBy,
+			IsPrivate:   isPrivate,
+			MyRole:      myRole,
+			CanManage:   roomCanManage,
+			CreatedAt:   roomCreatedAt,
+		}
+		if channelType == "voice" {
+			group.VoiceChannels = append(group.VoiceChannels, channel)
+		} else {
+			group.TextChannels = append(group.TextChannels, channel)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]RoomGroup, 0, len(order))
+	for _, id := range order {
+		out = append(out, *byID[id])
+	}
+	return out, nil
+}
+
+func (s *Store) CreateRoomGroup(ctx context.Context, name string, createdBy uuid.UUID) (RoomGroup, error) {
+	var g RoomGroup
+	err := s.DB.QueryRowContext(ctx, `
+		INSERT INTO room_groups (name, created_by)
+		VALUES ($1, $2)
+		RETURNING id, name, created_by, created_at
+	`, name, createdBy).Scan(&g.ID, &g.Name, &g.CreatedBy, &g.CreatedAt)
+	if err != nil {
+		return RoomGroup{}, err
+	}
+	g.CanManage = true
+	g.TextChannels = []GroupChannel{}
+	g.VoiceChannels = []GroupChannel{}
+	return g, nil
+}
+
+func (s *Store) UpdateRoomGroupName(ctx context.Context, groupID uuid.UUID, userID uuid.UUID, name string) error {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE room_groups
+		SET name = $3
+		WHERE id = $1
+		  AND (
+		    created_by = $2 OR EXISTS (
+		      SELECT 1
+		      FROM group_channels gc
+		      JOIN room_members rm ON rm.room_id = gc.room_id
+		      WHERE gc.group_id = room_groups.id
+		        AND rm.user_id = $2
+		        AND rm.role = 'admin'
+		    )
+		  )
+	`, groupID, userID, name)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrForbidden
+	}
+	return nil
+}
+
+func (s *Store) CreateGroupChannel(ctx context.Context, groupID uuid.UUID, name, channelType string, createdBy uuid.UUID) (GroupChannel, error) {
+	if channelType != "text" && channelType != "voice" {
+		return GroupChannel{}, fmt.Errorf("invalid channel type")
+	}
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return GroupChannel{}, err
+	}
+	defer tx.Rollback()
+
+	var canManage bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT (g.created_by = $2 OR EXISTS(
+			SELECT 1
+			FROM group_channels gc
+			JOIN room_members rm ON rm.room_id = gc.room_id
+			WHERE gc.group_id = g.id
+			  AND rm.user_id = $2
+			  AND rm.role = 'admin'
+		))
+		FROM room_groups g
+		WHERE g.id = $1
+	`, groupID, createdBy).Scan(&canManage); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return GroupChannel{}, ErrNotFound
+		}
+		return GroupChannel{}, err
+	}
+	if !canManage {
+		return GroupChannel{}, ErrForbidden
+	}
+
+	var position int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(position), -1) + 1
+		FROM group_channels
+		WHERE group_id = $1 AND channel_type = $2
+	`, groupID, channelType).Scan(&position); err != nil {
+		return GroupChannel{}, err
+	}
+
+	var out GroupChannel
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO rooms (name, created_by, is_private)
+		VALUES ($1, $2, TRUE)
+		RETURNING id, name, created_by, is_private, created_at
+	`, name, createdBy).Scan(&out.ID, &out.Name, &out.CreatedBy, &out.IsPrivate, &out.CreatedAt); err != nil {
+		return GroupChannel{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO room_members (room_id, user_id, role)
+		VALUES ($1, $2, 'admin')
+		ON CONFLICT DO NOTHING
+	`, out.ID, createdBy); err != nil {
+		return GroupChannel{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO group_channels (group_id, room_id, channel_type, position)
+		VALUES ($1, $2, $3, $4)
+	`, groupID, out.ID, channelType, position); err != nil {
+		return GroupChannel{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return GroupChannel{}, err
+	}
+
+	out.ChannelType = channelType
+	out.Position = position
+	out.MyRole = "admin"
+	out.CanManage = true
+	return out, nil
 }
 
 func (s *Store) JoinRoom(ctx context.Context, roomID, userID uuid.UUID) error {
@@ -406,6 +670,14 @@ func (s *Store) ListFriends(ctx context.Context, userID uuid.UUID) ([]Friend, er
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) IsFriend(ctx context.Context, userID, targetID uuid.UUID) (bool, error) {
+	var exists bool
+	if err := s.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM friendships WHERE user_id = $1 AND friend_id = $2)`, userID, targetID).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func (s *Store) ListIncomingFriendRequests(ctx context.Context, userID uuid.UUID) ([]FriendRequest, error) {

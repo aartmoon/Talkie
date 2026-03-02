@@ -1,12 +1,41 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import { APIError, api } from './lib/api';
-import type { Friend, FriendsResponse, Message, Participant, Room as AppRoom, User } from './lib/types';
+import type { Friend, FriendsResponse, Message, Participant, Room as AppRoom, RoomGroup, User } from './lib/types';
 import { FriendsPanel } from './components/FriendsPanel';
 
 type AuthView = 'login' | 'register' | 'verify' | 'forgot' | 'reset';
-type SidebarTab = 'rooms' | 'dms' | 'friends';
-type MiniProfile = { id: string; username: string; email?: string };
+type SidebarTab = 'rooms' | 'friends';
+type CreateMode = 'server' | 'room';
+type MiniProfile = { id: string; username: string; createdAt?: string; isFriend?: boolean; loading: boolean };
+
+function flattenGroupChannels(groups: RoomGroup[]): AppRoom[] {
+  const out: AppRoom[] = [];
+  for (const group of groups) {
+    for (const channel of [...group.text_channels, ...group.voice_channels]) {
+      out.push({
+        id: channel.id,
+        name: channel.name,
+        created_by: channel.created_by,
+        is_private: channel.is_private,
+        channel_type: channel.channel_type,
+        group_id: group.id,
+        position: channel.position,
+        my_role: channel.my_role,
+        can_manage: channel.can_manage,
+        created_at: channel.created_at,
+      });
+    }
+  }
+  return out;
+}
+
+function mergeGroupedAndStandalone(groups: RoomGroup[], allRooms: AppRoom[]): AppRoom[] {
+  const grouped = flattenGroupChannels(groups);
+  const groupedIDs = new Set(grouped.map((room) => room.id));
+  const standalone = allRooms.filter((room) => !groupedIDs.has(room.id));
+  return [...grouped, ...standalone];
+}
 
 type VideoTrackItem = {
   key: string;
@@ -110,6 +139,7 @@ export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('talkie_token'));
   const [rooms, setRooms] = useState<AppRoom[]>([]);
+  const [groups, setGroups] = useState<RoomGroup[]>([]);
   const [dmRooms, setDMRooms] = useState<AppRoom[]>([]);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('rooms');
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
@@ -122,8 +152,9 @@ export function App() {
   const [unreadByRoom, setUnreadByRoom] = useState<Record<string, number>>({});
   const [hasNewFriendRequest, setHasNewFriendRequest] = useState(false);
   const [miniProfile, setMiniProfile] = useState<MiniProfile | null>(null);
-  const [newRoomName, setNewRoomName] = useState('');
-  const [showCreateRoomModal, setShowCreateRoomModal] = useState(false);
+  const [newEntityName, setNewEntityName] = useState('');
+  const [createMode, setCreateMode] = useState<CreateMode>('server');
+  const [showCreateGroupModal, setShowCreateGroupModal] = useState(false);
   const [inviteQuery, setInviteQuery] = useState('');
   const [inviteResults, setInviteResults] = useState<Friend[]>([]);
   const [generatingInviteLink, setGeneratingInviteLink] = useState(false);
@@ -186,13 +217,6 @@ export function App() {
   const lastRoomMessageIDsRef = useRef<Record<string, number>>({});
   const inviteJoinHandledRef = useRef(false);
 
-  const sortedRooms = useMemo(
-    () =>
-      [...rooms].sort(
-        (a, b) => (roomActivityByID[b.id] || new Date(b.created_at).getTime()) - (roomActivityByID[a.id] || new Date(a.created_at).getTime()),
-      ),
-    [rooms, roomActivityByID],
-  );
   const sortedDMRooms = useMemo(
     () =>
       [...dmRooms].sort(
@@ -200,13 +224,14 @@ export function App() {
       ),
     [dmRooms, roomActivityByID],
   );
-  const hasUnreadRooms = useMemo(
-    () => rooms.some((room) => (unreadByRoom[room.id] || 0) > 0),
-    [rooms, unreadByRoom],
+  const hasUnreadChats = useMemo(
+    () => [...rooms, ...dmRooms].some((room) => (unreadByRoom[room.id] || 0) > 0),
+    [rooms, dmRooms, unreadByRoom],
   );
-  const hasUnreadDMs = useMemo(
-    () => dmRooms.some((room) => (unreadByRoom[room.id] || 0) > 0),
-    [dmRooms, unreadByRoom],
+  const groupedRoomIDs = useMemo(() => new Set(flattenGroupChannels(groups).map((room) => room.id)), [groups]);
+  const standaloneRooms = useMemo(
+    () => rooms.filter((room) => !groupedRoomIDs.has(room.id)),
+    [rooms, groupedRoomIDs],
   );
   const hasFriendRequestBadge = hasNewFriendRequest;
   const friendIDs = useMemo(() => new Set(friendsData.friends.map((f) => f.id)), [friendsData.friends]);
@@ -231,6 +256,11 @@ export function App() {
     [selectedRoom, dmRooms],
   );
   const selectedRoomCanManage = Boolean(selectedRoom?.can_manage);
+  const selectedRoomChannelType = selectedRoom?.channel_type || '';
+  const selectedRoomIsTextOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'text');
+  const selectedRoomIsVoiceOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'voice');
+  const canUseCallUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsVoiceOnly || !selectedRoomChannelType));
+  const canUseChatUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsTextOnly || !selectedRoomChannelType));
 
   function videoKey(participantID: string, source: Track.Source, sid?: string): string {
     return sid || `${participantID}-${source}`;
@@ -274,19 +304,22 @@ export function App() {
     if (!token) return;
     (async () => {
       try {
-        const [me, list, dms, friends] = await Promise.all([
+        const [me, groupList, roomList, dms, friends] = await Promise.all([
           api.me(token),
+          api.listGroups(token),
           api.listRooms(token),
           api.listDMRooms(token),
           api.listFriends(token),
         ]);
+        const mergedRooms = mergeGroupedAndStandalone(groupList, roomList);
         setUser(me);
-        setRooms(list);
+        setGroups(groupList);
+        setRooms(mergedRooms);
         setDMRooms(dms);
         setFriendsData(friends);
         setRoomActivityByID((prev) => {
           const next = { ...prev };
-          for (const room of [...list, ...dms]) {
+          for (const room of [...mergedRooms, ...dms]) {
             if (!next[room.id]) next[room.id] = new Date(room.created_at).getTime();
           }
           return next;
@@ -323,9 +356,11 @@ export function App() {
     void api.joinByInviteLink(token, inviteToken)
       .then(async (room) => {
         if (!mounted) return;
-        const [list, dms] = await Promise.all([api.listRooms(token), api.listDMRooms(token)]);
+        const [groupList, roomList, dms] = await Promise.all([api.listGroups(token), api.listRooms(token), api.listDMRooms(token)]);
+        const mergedRooms = mergeGroupedAndStandalone(groupList, roomList);
         if (!mounted) return;
-        setRooms(list);
+        setGroups(groupList);
+        setRooms(mergedRooms);
         setDMRooms(dms);
         setRoomActivityByID((prev) => ({ ...prev, [room.id]: Date.now() }));
         await openRoom(room);
@@ -391,8 +426,12 @@ export function App() {
           const roomID = incomingMessage.room_id;
           const knownRoom = roomsRef.current.some((r) => r.id === roomID) || dmRoomsRef.current.some((r) => r.id === roomID);
           if (!knownRoom) {
-            void api.listDMRooms(token)
-              .then((dms) => setDMRooms(dms))
+            void Promise.all([api.listGroups(token), api.listRooms(token), api.listDMRooms(token)])
+              .then(([groupList, roomList, dms]) => {
+                setGroups(groupList);
+                setRooms(mergeGroupedAndStandalone(groupList, roomList));
+                setDMRooms(dms);
+              })
               .catch(() => {
                 // best effort
               });
@@ -434,6 +473,7 @@ export function App() {
             .catch(() => {
               // best effort
             });
+          return;
         }
       };
 
@@ -689,12 +729,15 @@ export function App() {
       localStorage.setItem('talkie_token', result.token);
       setToken(result.token);
       setUser(result.user);
-      const [list, dms, friends] = await Promise.all([
+      const [groupList, roomList, dms, friends] = await Promise.all([
+        api.listGroups(result.token),
         api.listRooms(result.token),
         api.listDMRooms(result.token),
         api.listFriends(result.token),
       ]);
-      setRooms(list);
+      const flatRooms = mergeGroupedAndStandalone(groupList, roomList);
+      setGroups(groupList);
+      setRooms(flatRooms);
       setDMRooms(dms);
       setFriendsData(friends);
       incomingRequestsRef.current = friends.incoming.length;
@@ -780,19 +823,63 @@ export function App() {
       .catch((err) => setError(err instanceof Error ? err.message : 'failed to reset password'));
   }
 
-  async function createRoom(e: React.FormEvent) {
-    e.preventDefault();
-    if (!token || !newRoomName.trim()) return;
+  async function refreshGroups() {
+    if (!token) return;
     try {
-      const room = await api.createRoom(token, newRoomName.trim());
-      setRooms((prev) => [room, ...prev]);
-      setRoomActivityByID((prev) => ({ ...prev, [room.id]: new Date(room.created_at).getTime() }));
-      setNewRoomName('');
-      setShowCreateRoomModal(false);
+      const [list, roomList] = await Promise.all([api.listGroups(token), api.listRooms(token)]);
+      const flatRooms = mergeGroupedAndStandalone(list, roomList);
+      setGroups(list);
+      setRooms(flatRooms);
+      setRoomActivityByID((prev) => {
+        const next = { ...prev };
+        for (const room of flatRooms) {
+          if (!next[room.id]) next[room.id] = new Date(room.created_at).getTime();
+        }
+        return next;
+      });
+    } catch {
+      // best effort
+    }
+  }
+
+  async function createStandaloneRoom(name: string) {
+    if (!token) return;
+    const room = await api.createRoom(token, name);
+    await refreshGroups();
+    await openRoom(room);
+  }
+
+  async function createGroup(e: React.FormEvent) {
+    e.preventDefault();
+    if (!token || !newEntityName.trim()) return;
+    try {
+      if (createMode === 'room') {
+        await createStandaloneRoom(newEntityName.trim());
+      } else {
+        const group = await api.createGroup(token, newEntityName.trim());
+        await refreshGroups();
+        const firstText = group.text_channels[0];
+        if (firstText) {
+          const room: AppRoom = {
+            id: firstText.id,
+            name: firstText.name,
+            created_by: firstText.created_by,
+            is_private: firstText.is_private,
+            channel_type: firstText.channel_type,
+            group_id: group.id,
+            position: firstText.position,
+            my_role: firstText.my_role,
+            can_manage: firstText.can_manage,
+            created_at: firstText.created_at,
+          };
+          await openRoom(room);
+        }
+      }
+      setNewEntityName('');
+      setShowCreateGroupModal(false);
       setSidebarTab('rooms');
-      await openRoom(room);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'failed to create room');
+      setError(err instanceof Error ? err.message : 'failed to create entity');
     }
   }
 
@@ -1479,6 +1566,34 @@ export function App() {
     }
   }
 
+  async function createChannelInGroup(groupID: string, type: 'text' | 'voice') {
+    if (!token) return;
+    const title = type === 'voice' ? 'Название голосового канала' : 'Название текстового канала';
+    const fallback = type === 'voice' ? 'Новый голосовой' : 'новый-канал';
+    const name = window.prompt(title, fallback)?.trim();
+    if (!name) return;
+    try {
+      const created = await api.createGroupChannel(token, groupID, name, type);
+      await refreshGroups();
+      await openRoom(created);
+      setSidebarTab('rooms');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to create channel');
+    }
+  }
+
+  async function renameGroupPrompt(groupID: string, currentName: string) {
+    if (!token) return;
+    const nextName = window.prompt('Новое название сервера', currentName)?.trim();
+    if (!nextName || nextName === currentName) return;
+    try {
+      await api.renameGroup(token, groupID, nextName);
+      await refreshGroups();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to rename group');
+    }
+  }
+
   async function copyText(text: string): Promise<boolean> {
     if (navigator.clipboard?.writeText) {
       try {
@@ -1551,7 +1666,7 @@ export function App() {
     if (!nextName || nextName === selectedRoom.name) return;
     try {
       const updated = await api.renameRoom(token, selectedRoom.id, nextName);
-      setRooms((prev) => prev.map((room) => (room.id === updated.id ? updated : room)));
+      await refreshGroups();
       setSelectedRoom(updated);
       setRoomMenuOpen(false);
     } catch (err) {
@@ -1568,7 +1683,7 @@ export function App() {
       if (activeCallRoomID === selectedRoom.id) {
         await leaveCall();
       }
-      setRooms((prev) => prev.filter((room) => room.id !== selectedRoom.id));
+      await refreshGroups();
       setUnreadByRoom((prev) => {
         const out = { ...prev };
         delete out[selectedRoom.id];
@@ -1592,7 +1707,7 @@ export function App() {
       if (activeCallRoomID === selectedRoom.id) {
         await leaveCall();
       }
-      setRooms((prev) => prev.filter((room) => room.id !== selectedRoom.id));
+      await refreshGroups();
       setUnreadByRoom((prev) => {
         const out = { ...prev };
         delete out[selectedRoom.id];
@@ -1619,9 +1734,24 @@ export function App() {
   }
 
   function openMiniProfile(id: string, username: string) {
-    const friend = friendsData.friends.find((f) => f.id === id);
-    const searchHit = userSearchResults.find((u) => u.id === id);
-    setMiniProfile({ id, username, email: friend?.email || searchHit?.email });
+    setMiniProfile({ id, username, loading: true });
+    if (!token) return;
+    void api.userProfile(token, id)
+      .then((profile) => {
+        setMiniProfile((prev) => {
+          if (!prev || prev.id !== id) return prev;
+          return {
+            id: profile.id,
+            username: profile.username,
+            createdAt: profile.created_at,
+            isFriend: profile.is_friend,
+            loading: false,
+          };
+        });
+      })
+      .catch(() => {
+        setMiniProfile((prev) => (prev && prev.id === id ? { ...prev, loading: false } : prev));
+      });
   }
 
   async function acceptFriend(requestID: number) {
@@ -1649,7 +1779,7 @@ export function App() {
     try {
       const room = await api.openDM(token, userID);
       await refreshSocial();
-      setSidebarTab('dms');
+      setSidebarTab('rooms');
       await openRoom(room);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to open dm');
@@ -1671,6 +1801,7 @@ export function App() {
     setMessages([]);
     setChatParticipants([]);
     setCallParticipants([]);
+    setGroups([]);
     setDMRooms([]);
     setFriendsData({ friends: [], incoming: [] });
     setActiveCallsByRoom({});
@@ -1814,7 +1945,7 @@ export function App() {
           {!sidebarCollapsed && (
             <div>
               <h2>Talkie</h2>
-              <small>Голосовые комнаты</small>
+              <small>Серверы и каналы</small>
             </div>
           )}
           <div className="sidebar-header-actions">
@@ -1822,10 +1953,11 @@ export function App() {
               type="button"
               className="create-room-plus"
               onClick={() => {
-                setShowCreateRoomModal(true);
+                setCreateMode('server');
+                setShowCreateGroupModal(true);
                 setSidebarTab('rooms');
               }}
-              title="Создать комнату"
+              title="Создать сервер"
             >
               +
             </button>
@@ -1845,10 +1977,7 @@ export function App() {
             <div className="sidebar-main">
               <div className="sidebar-tabs">
                 <button className={sidebarTab === 'rooms' ? 'active' : ''} onClick={() => setSidebarTab('rooms')} type="button">
-                  Комнаты {hasUnreadRooms && <span className="red-dot" />}
-                </button>
-                <button className={sidebarTab === 'dms' ? 'active' : ''} onClick={() => setSidebarTab('dms')} type="button">
-                  ЛС {hasUnreadDMs && <span className="red-dot" />}
+                  Чаты {hasUnreadChats && <span className="red-dot" />}
                 </button>
                 <button className={sidebarTab === 'friends' ? 'active' : ''} onClick={() => setSidebarTab('friends')} type="button">
                   Друзья {hasFriendRequestBadge && <span className="red-dot" />}
@@ -1859,7 +1988,7 @@ export function App() {
                   type="button"
                   className="current-call-card"
                   onClick={() => {
-                    setSidebarTab(activeCallRoomKind === 'dm' ? 'dms' : 'rooms');
+                    setSidebarTab('rooms');
                     openRoom(activeCallRoom);
                   }}
                   title="Перейти в беседу звонка"
@@ -1871,14 +2000,82 @@ export function App() {
 
               {sidebarTab === 'rooms' && (
                 <div className="rooms-panel">
+                  {groups.map((group) => (
+                    <div key={group.id} className="group-block">
+                      <div className="group-head">
+                        <strong>{group.name}</strong>
+                        {group.can_manage && (
+                          <div className="group-actions">
+                            <button type="button" className="ghost" onClick={() => renameGroupPrompt(group.id, group.name)}>
+                              Переименовать
+                            </button>
+                            <button type="button" className="ghost" onClick={() => createChannelInGroup(group.id, 'text')}>
+                              +Текст
+                            </button>
+                            <button type="button" className="ghost" onClick={() => createChannelInGroup(group.id, 'voice')}>
+                              +Голос
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      <small className="group-subtitle">Текст</small>
+                      <ul className="room-list">
+                        {group.text_channels.map((room) => (
+                          <li key={room.id}>
+                            <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
+                              <span className="room-hash">#</span>
+                              <span className="room-name">{room.name}</span>
+                              {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
+                              {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+
+                      <small className="group-subtitle">Голос</small>
+                      <ul className="room-list">
+                        {group.voice_channels.map((room) => (
+                          <li key={room.id}>
+                            <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
+                              <span className="room-hash">V</span>
+                              <span className="room-name">{room.name}</span>
+                              {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
+                              {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+
+                  {standaloneRooms.length > 0 && (
+                    <>
+                      <small className="group-subtitle">Обычные группы</small>
+                      <ul className="room-list">
+                        {standaloneRooms.map((room) => (
+                          <li key={room.id}>
+                            <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
+                              <span className="room-hash">#</span>
+                              <span className="room-name">{room.name}</span>
+                              {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
+                              {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+
+                  <strong>Личные сообщения</strong>
                   <ul className="room-list">
-                    {sortedRooms.map((room) => (
+                    {sortedDMRooms.map((room) => (
                       <li key={room.id}>
                         <button
                           className={selectedRoom?.id === room.id ? 'active' : ''}
                           onClick={() => openRoom(room)}
                         >
-                          <span className="room-hash">#</span>
+                          <span className="room-hash">@</span>
                           <span className="room-name">{room.name}</span>
                           {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
                           {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
@@ -1887,24 +2084,6 @@ export function App() {
                     ))}
                   </ul>
                 </div>
-              )}
-
-              {sidebarTab === 'dms' && (
-                <ul className="room-list">
-                  {sortedDMRooms.map((room) => (
-                    <li key={room.id}>
-                      <button
-                        className={selectedRoom?.id === room.id ? 'active' : ''}
-                        onClick={() => openRoom(room)}
-                      >
-                        <span className="room-hash">@</span>
-                        <span className="room-name">{room.name}</span>
-                        {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
-                        {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
               )}
 
               {sidebarTab === 'friends' && (
@@ -1920,6 +2099,7 @@ export function App() {
                   onDeclineFriend={(requestID) => declineFriend(requestID)}
                   onGenerateFriendInviteLink={() => generateFriendInviteLink()}
                   onOpenDMWith={(userID) => openDMWith(userID)}
+                  onOpenProfile={(userID, uname) => openMiniProfile(userID, uname)}
                   onSearchChange={(nextQuery) => setUserSearchQuery(nextQuery)}
                   onSearchSubmit={handleUserSearch}
                 />
@@ -1935,48 +2115,24 @@ export function App() {
             </div>
           </>
         ) : (
-          <div className="sidebar-rail">
-            <button
-              className={`rail-tab ${sidebarTab === 'rooms' ? 'active' : ''}`}
-              type="button"
-              title="Комнаты"
-              disabled
-            >
-              R
-              {hasUnreadRooms && <span className="red-dot" />}
-            </button>
-            <button
-              className={`rail-tab ${sidebarTab === 'dms' ? 'active' : ''}`}
-              type="button"
-              title="Личные сообщения"
-              disabled
-            >
-              D
-              {hasUnreadDMs && <span className="red-dot" />}
-            </button>
-            <button
-              className={`rail-tab ${sidebarTab === 'friends' ? 'active' : ''}`}
-              type="button"
-              title="Друзья"
-              disabled
-            >
-              F
-              {hasFriendRequestBadge && <span className="red-dot" />}
-            </button>
-          </div>
+          <div className="sidebar-rail" />
         )}
       </aside>
 
       <main className="content">
         {!selectedRoom ? (
-          <section className="placeholder">Выберите комнату слева или создайте новую.</section>
+          <section className="placeholder">Выберите канал слева или создайте новый сервер.</section>
         ) : (
           <>
             <section className="media-panel">
               <div className="media-header">
                 <div className="media-title">
                   <h3>{selectedRoom.name}</h3>
-                  <small>{inCall ? 'Подключено к голосовому каналу' : 'Звонок и чат комнаты'}</small>
+                  <small>
+                    {canUseCallUI
+                      ? (inCall ? 'Подключено к голосовому каналу' : 'Звонок и чат канала')
+                      : 'Текстовый канал: только сообщения'}
+                  </small>
                 </div>
                 {!selectedRoomIsDM && (
                   <div className="room-menu-wrap">
@@ -1998,80 +2154,84 @@ export function App() {
                 )}
               </div>
 
-              <div className="call-roster">
-                <strong>В звонке ({callParticipants.length})</strong>
-                {callParticipants.length === 0 ? (
-                  <div className="participant-empty">Пока никого в звонке</div>
-                ) : (
-                  <ul className="call-roster-list">
-                    {callParticipants.map((p) => (
-                      <li key={p.id} className={activeSpeakerIDs.includes(p.id) ? 'is-speaking' : ''}>
-                        <span className="avatar-dot" />
-                        <button
-                          type="button"
-                          className="msg-user-btn participant-name"
-                          onClick={() => openMiniProfile(p.id, p.username)}
-                        >
-                          {p.username}
-                        </button>
-                        {p.micEnabled !== null && (
-                          <span className={`mic-badge ${p.micEnabled ? '' : 'off'}`}>
-                            {p.micEnabled ? 'мик' : 'выкл'}
-                          </span>
-                        )}
-                        {p.id !== roomRef.current?.localParticipant.identity && p.hasCamera && (
+              {canUseCallUI ? (
+                <div className="call-roster">
+                  <strong>В звонке ({callParticipants.length})</strong>
+                  {callParticipants.length === 0 ? (
+                    <div className="participant-empty">Пока никого в звонке</div>
+                  ) : (
+                    <ul className="call-roster-list">
+                      {callParticipants.map((p) => (
+                        <li key={p.id} className={activeSpeakerIDs.includes(p.id) ? 'is-speaking' : ''}>
+                          <span className="avatar-dot" />
                           <button
-                            className={`stream-watch-btn ${p.watchingCamera ? '' : 'control-off'}`}
-                            onClick={() => toggleRemoteVideo(p.id, Track.Source.Camera)}
                             type="button"
+                            className="msg-user-btn participant-name"
+                            onClick={() => openMiniProfile(p.id, p.username)}
                           >
-                            {p.watchingCamera ? 'Камера: вкл' : 'Камера: выкл'}
+                            {p.username}
                           </button>
-                        )}
-                        {p.id !== roomRef.current?.localParticipant.identity && p.hasScreen && (
-                          <button
-                            className={`stream-watch-btn ${p.watchingScreen ? '' : 'control-off'}`}
-                            onClick={() => toggleRemoteVideo(p.id, Track.Source.ScreenShare)}
-                            type="button"
-                          >
-                            {p.watchingScreen ? 'Экран: вкл' : 'Экран: выкл'}
-                          </button>
-                        )}
-                        {p.id !== roomRef.current?.localParticipant.identity && (
-                          <>
-                            <label className="participant-volume">
-                              Громк. голоса: {Math.round(getParticipantVolume(p.id, 'voice') * 100)}%
-                              <input
-                                type="range"
-                                min={0}
-                                max={100}
-                                step={1}
-                                value={Math.round(getParticipantVolume(p.id, 'voice') * 100)}
-                                onChange={(e) => setParticipantVolume(p.id, 'voice', Number(e.target.value) / 100)}
-                              />
-                            </label>
-                            <label className="participant-volume">
-                              Громк. демки: {Math.round(getParticipantVolume(p.id, 'screen') * 100)}%
-                              <input
-                                type="range"
-                                min={0}
-                                max={100}
-                                step={1}
-                                value={Math.round(getParticipantVolume(p.id, 'screen') * 100)}
-                                onChange={(e) => setParticipantVolume(p.id, 'screen', Number(e.target.value) / 100)}
-                              />
-                            </label>
-                          </>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-
-              {!inCall ? (
-                <div className="empty-video">Войдите в звонок, чтобы включить аудио и видео.</div>
+                          {p.micEnabled !== null && (
+                            <span className={`mic-badge ${p.micEnabled ? '' : 'off'}`}>
+                              {p.micEnabled ? 'мик' : 'выкл'}
+                            </span>
+                          )}
+                          {p.id !== roomRef.current?.localParticipant.identity && p.hasCamera && (
+                            <button
+                              className={`stream-watch-btn ${p.watchingCamera ? '' : 'control-off'}`}
+                              onClick={() => toggleRemoteVideo(p.id, Track.Source.Camera)}
+                              type="button"
+                            >
+                              {p.watchingCamera ? 'Камера: вкл' : 'Камера: выкл'}
+                            </button>
+                          )}
+                          {p.id !== roomRef.current?.localParticipant.identity && p.hasScreen && (
+                            <button
+                              className={`stream-watch-btn ${p.watchingScreen ? '' : 'control-off'}`}
+                              onClick={() => toggleRemoteVideo(p.id, Track.Source.ScreenShare)}
+                              type="button"
+                            >
+                              {p.watchingScreen ? 'Экран: вкл' : 'Экран: выкл'}
+                            </button>
+                          )}
+                          {p.id !== roomRef.current?.localParticipant.identity && (
+                            <>
+                              <label className="participant-volume">
+                                Громк. голоса: {Math.round(getParticipantVolume(p.id, 'voice') * 100)}%
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={100}
+                                  step={1}
+                                  value={Math.round(getParticipantVolume(p.id, 'voice') * 100)}
+                                  onChange={(e) => setParticipantVolume(p.id, 'voice', Number(e.target.value) / 100)}
+                                />
+                              </label>
+                              <label className="participant-volume">
+                                Громк. демки: {Math.round(getParticipantVolume(p.id, 'screen') * 100)}%
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={100}
+                                  step={1}
+                                  value={Math.round(getParticipantVolume(p.id, 'screen') * 100)}
+                                  onChange={(e) => setParticipantVolume(p.id, 'screen', Number(e.target.value) / 100)}
+                                />
+                              </label>
+                            </>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
               ) : (
+                <div className="participant-empty">В текстовом канале звонки отключены</div>
+              )}
+
+              {canUseCallUI && !inCall ? (
+                <div className="empty-video">Войдите в звонок, чтобы включить аудио и видео.</div>
+              ) : canUseCallUI ? (
                 <>
                   {focusedTile && (
                     <div className={activeSpeakerIDs.includes(focusedTile.participantId) ? 'stage speaking' : 'stage'}>
@@ -2094,116 +2254,127 @@ export function App() {
                     ))}
                   </div>
                 </>
-              )}
-
-              <div className="voice-dock">
-                {!inCall ? (
-                  <>
-                    <button className="big-join" onClick={joinCall} disabled={connectingMedia}>
-                      {connectingMedia ? 'Подключение...' : 'Подключиться к звонку'}
-                    </button>
-                    <button
-                      className={`dock-btn ${showMicSettings ? '' : 'control-off'}`}
-                      type="button"
-                      onClick={() => setShowMicSettings((prev) => !prev)}
-                    >
-                      Микрофон
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <button className={`dock-btn ${micEnabled ? '' : 'control-off'}`} onClick={toggleMic} disabled={deafened}>
-                      {micEnabled ? 'Мик вкл' : 'Мик выкл'}
-                    </button>
-                    <button
-                      className={`dock-btn ${showMicSettings ? '' : 'control-off'}`}
-                      type="button"
-                      onClick={() => setShowMicSettings((prev) => !prev)}
-                    >
-                      Настройки микрофона
-                    </button>
-                    <button className={`dock-btn ${cameraEnabled ? '' : 'control-off'}`} onClick={toggleCamera}>
-                      {cameraEnabled ? 'Камера вкл' : 'Камера выкл'}
-                    </button>
-                    <button className={`dock-btn ${screenEnabled ? '' : 'control-off'}`} onClick={toggleScreenShare}>
-                      {screenEnabled ? 'Экран вкл' : 'Экран'}
-                    </button>
-                    <button className={`dock-btn ${deafened ? 'control-off' : ''}`} onClick={toggleDeafen}>
-                      {deafened ? 'Заглушен' : 'Заглушить'}
-                    </button>
-                    <button className="danger" onClick={leaveCall}>Отключиться</button>
-                  </>
-                )}
-              </div>
-              {showMicSettings && (
-                <div className="mic-settings-popover">
-                  <label className="mic-setting-row">
-                    <input
-                      type="checkbox"
-                      checked={joinWithMicEnabled}
-                      onChange={(e) => setJoinWithMicEnabled(e.target.checked)}
-                    />
-                    Входить в звонок с включенным микрофоном
-                  </label>
-                </div>
+              ) : null}
+              {canUseCallUI && (
+                <>
+                  <div className="voice-dock">
+                    {!inCall ? (
+                      <>
+                        <button className="big-join" onClick={joinCall} disabled={connectingMedia}>
+                          {connectingMedia ? 'Подключение...' : 'Подключиться к звонку'}
+                        </button>
+                        <button
+                          className={`dock-btn ${showMicSettings ? '' : 'control-off'}`}
+                          type="button"
+                          onClick={() => setShowMicSettings((prev) => !prev)}
+                        >
+                          Микрофон
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button className={`dock-btn ${micEnabled ? '' : 'control-off'}`} onClick={toggleMic} disabled={deafened}>
+                          {micEnabled ? 'Мик вкл' : 'Мик выкл'}
+                        </button>
+                        <button
+                          className={`dock-btn ${showMicSettings ? '' : 'control-off'}`}
+                          type="button"
+                          onClick={() => setShowMicSettings((prev) => !prev)}
+                        >
+                          Настройки микрофона
+                        </button>
+                        <button className={`dock-btn ${cameraEnabled ? '' : 'control-off'}`} onClick={toggleCamera}>
+                          {cameraEnabled ? 'Камера вкл' : 'Камера выкл'}
+                        </button>
+                        <button className={`dock-btn ${screenEnabled ? '' : 'control-off'}`} onClick={toggleScreenShare}>
+                          {screenEnabled ? 'Экран вкл' : 'Экран'}
+                        </button>
+                        <button className={`dock-btn ${deafened ? 'control-off' : ''}`} onClick={toggleDeafen}>
+                          {deafened ? 'Заглушен' : 'Заглушить'}
+                        </button>
+                        <button className="danger" onClick={leaveCall}>Отключиться</button>
+                      </>
+                    )}
+                  </div>
+                  {showMicSettings && (
+                    <div className="mic-settings-popover">
+                      <label className="mic-setting-row">
+                        <input
+                          type="checkbox"
+                          checked={joinWithMicEnabled}
+                          onChange={(e) => setJoinWithMicEnabled(e.target.checked)}
+                        />
+                        Входить в звонок с включенным микрофоном
+                      </label>
+                    </div>
+                  )}
+                </>
               )}
 
             </section>
 
             <div className="bottom-row">
-              <section className="chat-panel">
-                <div className="panel-heading">Чат комнаты</div>
-                <div className="messages" ref={messagesRef}>
-                  {messages.map((m) => (
-                    <p key={m.id} className={m.message_type === 'image' ? 'image-message' : ''}>
-                      <button
-                        type="button"
-                        className="msg-user-btn msg-user-top"
-                        onClick={() => openMiniProfile(m.user_id, m.username)}
-                        title={m.user_id === user.id ? 'Вы' : 'Профиль'}
-                      >
-                        {m.username}
-                      </button>
-                      {!(m.message_type === 'image' && looksLikeImageFilename(m.content)) && (
-                        <span className="msg-content">{m.content}</span>
-                      )}
-                      {m.message_type === 'image' && m.media_url && (
-                        <img
-                          className="chat-image"
-                          src={mediaUrl(api.apiBase, m.media_url)}
-                          alt={m.content || 'изображение'}
-                          onClick={() => setLightboxImageURL(mediaUrl(api.apiBase, m.media_url))}
-                          onLoad={() => {
-                            const el = messagesRef.current;
-                            if (el) el.scrollTop = el.scrollHeight;
-                          }}
-                        />
-                      )}
-                    </p>
-                  ))}
-                </div>
+              {canUseChatUI ? (
+                <section className="chat-panel">
+                  <div className="panel-heading">Чат канала</div>
+                  <div className="messages" ref={messagesRef}>
+                    {messages.map((m) => (
+                      <p key={m.id} className={m.message_type === 'image' ? 'image-message' : ''}>
+                        <button
+                          type="button"
+                          className="msg-user-btn msg-user-top"
+                          onClick={() => openMiniProfile(m.user_id, m.username)}
+                          title={m.user_id === user.id ? 'Вы' : 'Профиль'}
+                        >
+                          {m.username}
+                        </button>
+                        {!(m.message_type === 'image' && looksLikeImageFilename(m.content)) && (
+                          <span className="msg-content">{m.content}</span>
+                        )}
+                        {m.message_type === 'image' && m.media_url && (
+                          <img
+                            className="chat-image"
+                            src={mediaUrl(api.apiBase, m.media_url)}
+                            alt={m.content || 'изображение'}
+                            onClick={() => setLightboxImageURL(mediaUrl(api.apiBase, m.media_url))}
+                            onLoad={() => {
+                              const el = messagesRef.current;
+                              if (el) el.scrollTop = el.scrollHeight;
+                            }}
+                          />
+                        )}
+                      </p>
+                    ))}
+                  </div>
 
-                <form onSubmit={sendChatMessage} className="chat-form">
-                  <label className="attach-btn" title="Прикрепить изображение">
-                    +
+                  <form onSubmit={sendChatMessage} className="chat-form">
+                    <label className="attach-btn" title="Прикрепить изображение">
+                      +
+                      <input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp,image/gif"
+                        onChange={(e) => setPendingImage(e.target.files?.[0] || null)}
+                      />
+                    </label>
                     <input
-                      type="file"
-                      accept="image/png,image/jpeg,image/webp,image/gif"
-                      onChange={(e) => setPendingImage(e.target.files?.[0] || null)}
+                      value={chatInput}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      onPaste={handleChatPaste}
+                      placeholder={pendingImage ? 'Подпись к изображению (необязательно)' : 'Напишите сообщение'}
                     />
-                  </label>
-                  <input
-                    value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    onPaste={handleChatPaste}
-                    placeholder={pendingImage ? 'Подпись к изображению (необязательно)' : 'Напишите сообщение'}
-                  />
-                  <button type="submit">{pendingImage ? 'Отправить фото' : 'Отправить'}</button>
-                </form>
-                {pendingImage && <small className="pending-file">Изображение прикреплено</small>}
-              </section>
+                    <button type="submit">{pendingImage ? 'Отправить фото' : 'Отправить'}</button>
+                  </form>
+                  {pendingImage && <small className="pending-file">Изображение прикреплено</small>}
+                </section>
+              ) : (
+                <section className="chat-panel">
+                  <div className="panel-heading">Чат канала</div>
+                  <div className="participant-empty">В голосовом канале текстовый чат отключен</div>
+                </section>
+              )}
 
-              <section className="members-panel">
+              {!selectedRoomIsDM && (
+                <section className="members-panel">
                 <div className="participants invite-panel">
                   <strong>Приглашения</strong>
                   {selectedRoomIsDM ? (
@@ -2254,7 +2425,8 @@ export function App() {
                     </ul>
                   )}
                 </div>
-              </section>
+                </section>
+              )}
             </div>
           </>
         )}
@@ -2263,14 +2435,28 @@ export function App() {
           <div className="mini-profile-overlay" onClick={() => setMiniProfile(null)} role="button" tabIndex={0}>
             <div className="mini-profile-card" onClick={(e) => e.stopPropagation()}>
               <h4>{miniProfile.username}</h4>
-              <small>{miniProfile.email || miniProfile.id}</small>
+              {miniProfile.loading ? (
+                <small>Загрузка профиля...</small>
+              ) : (
+                <>
+                  <small>
+                    Зарегистрирован: {miniProfile.createdAt ? new Date(miniProfile.createdAt).toLocaleDateString('ru-RU') : 'нет данных'}
+                  </small>
+                  <small>
+                    Статус: {miniProfile.id === user.id ? 'Это вы' : (miniProfile.isFriend ? 'В друзьях' : 'Не в друзьях')}
+                  </small>
+                </>
+              )}
               {miniProfile.id === user.id ? (
                 <button type="button" disabled>Вы</button>
-              ) : friendIDs.has(miniProfile.id) ? (
+              ) : (
+                <button type="button" onClick={() => { void openDMWith(miniProfile.id); setMiniProfile(null); }}>Написать в лс</button>
+              )}
+              {miniProfile.id !== user.id && (miniProfile.isFriend || friendIDs.has(miniProfile.id)) ? (
                 <button type="button" disabled>Уже в друзьях</button>
               ) : sentFriendRequests[miniProfile.id] ? (
                 <button type="button" disabled>Запрос отправлен</button>
-              ) : (
+              ) : miniProfile.id !== user.id ? (
                 <button
                   type="button"
                   onClick={() => {
@@ -2279,7 +2465,7 @@ export function App() {
                 >
                   Добавить в друзья
                 </button>
-              )}
+              ) : null}
             </div>
           </div>
         )}
@@ -2297,22 +2483,30 @@ export function App() {
             />
           </div>
         )}
-        {showCreateRoomModal && (
-          <div className="mini-profile-overlay" onClick={() => setShowCreateRoomModal(false)} role="button" tabIndex={0}>
-            <form className="mini-profile-card create-room-modal" onSubmit={createRoom} onClick={(e) => e.stopPropagation()}>
-              <h4>Создать комнату</h4>
+        {showCreateGroupModal && (
+          <div className="mini-profile-overlay" onClick={() => setShowCreateGroupModal(false)} role="button" tabIndex={0}>
+            <form className="mini-profile-card create-room-modal" onSubmit={createGroup} onClick={(e) => e.stopPropagation()}>
+              <h4>{createMode === 'server' ? 'Создать сервер' : 'Создать обычную группу'}</h4>
+              <div className="create-mode-switch">
+                <button type="button" className={createMode === 'server' ? '' : 'ghost'} onClick={() => setCreateMode('server')}>
+                  Сервер
+                </button>
+                <button type="button" className={createMode === 'room' ? '' : 'ghost'} onClick={() => setCreateMode('room')}>
+                  Обычная группа
+                </button>
+              </div>
               <label>
                 Название
                 <input
-                  value={newRoomName}
-                  onChange={(e) => setNewRoomName(e.target.value)}
-                  placeholder="Например, команда"
+                  value={newEntityName}
+                  onChange={(e) => setNewEntityName(e.target.value)}
+                  placeholder={createMode === 'server' ? 'Например, Team Alpha' : 'Например, Общая беседа'}
                   required
                   autoFocus
                 />
               </label>
               <button type="submit">Создать</button>
-              <button type="button" className="ghost" onClick={() => setShowCreateRoomModal(false)}>Отмена</button>
+              <button type="button" className="ghost" onClick={() => setShowCreateGroupModal(false)}>Отмена</button>
             </form>
           </div>
         )}

@@ -11,6 +11,9 @@ export type Room = {
   name: string;
   created_by: string;
   is_private?: boolean;
+  channel_type?: 'text' | 'voice';
+  group_id?: string;
+  position?: number;
   my_role?: 'admin' | 'member';
   can_manage?: boolean;
   created_at: string;
@@ -51,4 +54,33 @@ export type FriendRequest = {
 export type FriendsResponse = {
   friends: Friend[];
   incoming: FriendRequest[];
+};
+
+export type UserProfile = {
+  id: string;
+  username: string;
+  created_at: string;
+  is_friend: boolean;
+};
+
+export type GroupChannel = {
+  id: string;
+  name: string;
+  channel_type: 'text' | 'voice';
+  position: number;
+  created_by: string;
+  is_private: boolean;
+  my_role?: 'admin' | 'member';
+  can_manage?: boolean;
+  created_at: string;
+};
+
+export type RoomGroup = {
+  id: string;
+  name: string;
+  created_by: string;
+  can_manage: boolean;
+  created_at: string;
+  text_channels: GroupChannel[];
+  voice_channels: GroupChannel[];
 };

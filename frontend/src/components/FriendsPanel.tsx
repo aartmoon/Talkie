@@ -13,6 +13,7 @@ type FriendsPanelProps = {
   onDeclineFriend: (requestID: number) => void;
   onGenerateFriendInviteLink: () => void;
   onOpenDMWith: (userID: string) => void;
+  onOpenProfile: (userID: string, username: string) => void;
   onSearchChange: (nextQuery: string) => void;
   onSearchSubmit: (e: FormEvent) => void;
 };
@@ -29,6 +30,7 @@ export function FriendsPanel({
   onDeclineFriend,
   onGenerateFriendInviteLink,
   onOpenDMWith,
+  onOpenProfile,
   onSearchChange,
   onSearchSubmit,
 }: FriendsPanelProps) {
@@ -71,7 +73,13 @@ export function FriendsPanel({
         <ul className="participant-list">
           {friendsData.incoming.map((fr) => (
             <li key={fr.id}>
-              <span className="participant-name">{fr.requester_username}</span>
+              <button
+                type="button"
+                className="msg-user-btn participant-name"
+                onClick={() => onOpenProfile(fr.requester_id, fr.requester_username)}
+              >
+                {fr.requester_username}
+              </button>
               <button type="button" onClick={() => onAcceptFriend(fr.id)}>Принять</button>
               <button type="button" className="ghost" onClick={() => onDeclineFriend(fr.id)}>Отклонить</button>
             </li>
@@ -83,7 +91,13 @@ export function FriendsPanel({
         <ul className="participant-list">
           {friendsData.friends.map((f) => (
             <li key={f.id}>
-              <span className="participant-name">{f.username}</span>
+              <button
+                type="button"
+                className="msg-user-btn participant-name"
+                onClick={() => onOpenProfile(f.id, f.username)}
+              >
+                {f.username}
+              </button>
               <button type="button" onClick={() => onOpenDMWith(f.id)}>Написать</button>
             </li>
           ))}

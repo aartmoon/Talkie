@@ -219,7 +219,7 @@ button.danger {
 
 .sidebar-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
 }
 
@@ -280,6 +280,57 @@ button.danger {
   min-height: 0;
   overflow: auto;
   align-content: start;
+}
+
+.group-block {
+  border: 1px solid #2a3146;
+  border-radius: 10px;
+  padding: 8px;
+  display: grid;
+  gap: 6px;
+  background: #151b2a;
+}
+
+.group-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.group-head strong {
+  font-size: 13px;
+}
+
+.group-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.group-actions button {
+  min-height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.group-subtitle {
+  color: #94a5d7;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.create-mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.create-mode-switch button {
+  min-height: 32px;
 }
 
 .room-list {
