@@ -5,9 +5,9 @@ import type { Friend, FriendsResponse, Message, Participant, Room as AppRoom, Ro
 import { FriendsPanel } from './components/FriendsPanel';
 
 type AuthView = 'login' | 'register' | 'verify' | 'forgot' | 'reset';
-type SidebarTab = 'rooms' | 'friends';
 type CreateMode = 'server' | 'room';
 type MiniProfile = { id: string; username: string; createdAt?: string; isFriend?: boolean; loading: boolean };
+type SidebarView = { kind: 'root' } | { kind: 'group'; groupID: string };
 
 function flattenGroupChannels(groups: RoomGroup[]): AppRoom[] {
   const out: AppRoom[] = [];
@@ -28,6 +28,24 @@ function flattenGroupChannels(groups: RoomGroup[]): AppRoom[] {
     }
   }
   return out;
+}
+
+function toAppRoomFromGroupChannel(
+  channel: RoomGroup['text_channels'][number] | RoomGroup['voice_channels'][number],
+  groupID: string,
+): AppRoom {
+  return {
+    id: channel.id,
+    name: channel.name,
+    created_by: channel.created_by,
+    is_private: channel.is_private,
+    channel_type: channel.channel_type,
+    group_id: groupID,
+    position: channel.position,
+    my_role: channel.my_role,
+    can_manage: channel.can_manage,
+    created_at: channel.created_at,
+  };
 }
 
 function mergeGroupedAndStandalone(groups: RoomGroup[], allRooms: AppRoom[]): AppRoom[] {
@@ -90,6 +108,12 @@ function volumeKey(kind: 'voice' | 'screen', participantID: string): string {
   return `talkie_${kind}_volume_${participantID}`;
 }
 
+function previewText(message: Message): string {
+  if (message.message_type === 'image') return '[Фото]';
+  const text = message.content.trim();
+  return text.length > 80 ? `${text.slice(0, 77)}...` : text;
+}
+
 function VideoTile({
   item,
   muted,
@@ -141,7 +165,7 @@ export function App() {
   const [rooms, setRooms] = useState<AppRoom[]>([]);
   const [groups, setGroups] = useState<RoomGroup[]>([]);
   const [dmRooms, setDMRooms] = useState<AppRoom[]>([]);
-  const [sidebarTab, setSidebarTab] = useState<SidebarTab>('rooms');
+  const [sidebarView, setSidebarView] = useState<SidebarView>({ kind: 'root' });
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
     () => localStorage.getItem('talkie_sidebar_collapsed') === '1',
   );
@@ -150,7 +174,19 @@ export function App() {
   const [userSearchResults, setUserSearchResults] = useState<Friend[]>([]);
   const [sentFriendRequests, setSentFriendRequests] = useState<Record<string, boolean>>({});
   const [unreadByRoom, setUnreadByRoom] = useState<Record<string, number>>({});
+  const [lastMessagePreviewByRoom, setLastMessagePreviewByRoom] = useState<Record<string, string>>({});
+  const [mutedRooms, setMutedRooms] = useState<Record<string, boolean>>(
+    () => {
+      try {
+        const raw = localStorage.getItem('talkie_muted_rooms');
+        return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+      } catch {
+        return {};
+      }
+    },
+  );
   const [hasNewFriendRequest, setHasNewFriendRequest] = useState(false);
+  const [showFriendsModal, setShowFriendsModal] = useState(false);
   const [miniProfile, setMiniProfile] = useState<MiniProfile | null>(null);
   const [newEntityName, setNewEntityName] = useState('');
   const [createMode, setCreateMode] = useState<CreateMode>('server');
@@ -210,10 +246,12 @@ export function App() {
   const deafenedRef = useRef(false);
   const watchedVideoKeysRef = useRef<Record<string, boolean>>({});
   const callPresenceIDsRef = useRef<Set<string>>(new Set());
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const audioUnlockedRef = useRef(false);
   const friendsInitRef = useRef(false);
   const incomingRequestsRef = useRef(0);
   const selectedRoomIDRef = useRef<string | null>(null);
-  const sidebarTabRef = useRef<SidebarTab>('rooms');
+  const mutedRoomsRef = useRef<Record<string, boolean>>({});
   const lastRoomMessageIDsRef = useRef<Record<string, number>>({});
   const inviteJoinHandledRef = useRef(false);
 
@@ -233,7 +271,6 @@ export function App() {
     () => rooms.filter((room) => !groupedRoomIDs.has(room.id)),
     [rooms, groupedRoomIDs],
   );
-  const hasFriendRequestBadge = hasNewFriendRequest;
   const friendIDs = useMemo(() => new Set(friendsData.friends.map((f) => f.id)), [friendsData.friends]);
   const focusedTile = useMemo(
     () => videoTracks.find((track) => track.key === focusedTileKey) || videoTracks[0] || null,
@@ -261,6 +298,17 @@ export function App() {
   const selectedRoomIsVoiceOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'voice');
   const canUseCallUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsVoiceOnly || !selectedRoomChannelType));
   const canUseChatUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsTextOnly || !selectedRoomChannelType));
+  const sortedStandaloneRooms = useMemo(
+    () =>
+      [...standaloneRooms].sort(
+        (a, b) => (roomActivityByID[b.id] || new Date(b.created_at).getTime()) - (roomActivityByID[a.id] || new Date(a.created_at).getTime()),
+      ),
+    [standaloneRooms, roomActivityByID],
+  );
+  const selectedSidebarGroup = useMemo(
+    () => (sidebarView.kind === 'group' ? groups.find((group) => group.id === sidebarView.groupID) || null : null),
+    [sidebarView, groups],
+  );
 
   function videoKey(participantID: string, source: Track.Source, sid?: string): string {
     return sid || `${participantID}-${source}`;
@@ -275,6 +323,28 @@ export function App() {
     const id = window.setTimeout(() => setCopyNotice(null), 2200);
     return () => window.clearTimeout(id);
   }, [copyNotice]);
+
+  useEffect(() => {
+    const unlock = () => {
+      try {
+        if (!audioCtxRef.current) {
+          audioCtxRef.current = new window.AudioContext();
+        }
+        void audioCtxRef.current.resume();
+        audioUnlockedRef.current = true;
+      } catch {
+        // best effort
+      }
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+  }, []);
 
   useEffect(() => {
     watchedVideoKeysRef.current = watchedVideoKeys;
@@ -297,8 +367,8 @@ export function App() {
   }, [dmRooms]);
 
   useEffect(() => {
-    sidebarTabRef.current = sidebarTab;
-  }, [sidebarTab]);
+    mutedRoomsRef.current = mutedRooms;
+  }, [mutedRooms]);
 
   useEffect(() => {
     if (!token) return;
@@ -391,7 +461,7 @@ export function App() {
       .then(async (friend) => {
         setAuthMessage(`Вы добавили ${friend.username} в друзья.`);
         await refreshSocial();
-        setSidebarTab('friends');
+        setShowFriendsModal(true);
       })
       .catch((err) => {
         setError(err instanceof Error ? err.message : 'failed to accept friend invite');
@@ -437,21 +507,23 @@ export function App() {
               });
           }
           lastRoomMessageIDsRef.current[roomID] = incomingMessage.id;
+          setLastMessagePreviewByRoom((prev) => ({ ...prev, [roomID]: previewText(incomingMessage) }));
           setRoomActivityByID((prev) => {
             const ts = new Date(incomingMessage.created_at).getTime();
             if ((prev[roomID] || 0) >= ts) return prev;
             return { ...prev, [roomID]: ts };
           });
+          if (!mutedRoomsRef.current[roomID]) {
+            playNotifyTone('message');
+          }
           if (selectedRoomIDRef.current !== roomID) {
             setUnreadByRoom((prev) => ({ ...prev, [roomID]: (prev[roomID] || 0) + 1 }));
           }
           return;
         }
         if (payload.type === 'friend_request_event') {
-          if (sidebarTabRef.current !== 'friends') {
-            setHasNewFriendRequest(true);
-            playNotifyTone('request');
-          }
+          setHasNewFriendRequest(true);
+          playNotifyTone('request');
           void api.listFriends(token)
             .then((social) => {
               setFriendsData(social);
@@ -508,6 +580,7 @@ export function App() {
         const latest = await api.listMessages(token, roomID, 1);
         if (!mounted || latest.length === 0) return;
         const message = latest[0];
+        setLastMessagePreviewByRoom((prev) => ({ ...prev, [roomID]: previewText(message) }));
 
         setRoomActivityByID((prev) => {
           const ts = new Date(message.created_at).getTime();
@@ -520,6 +593,9 @@ export function App() {
           lastRoomMessageIDsRef.current[roomID] = message.id;
           const isActiveRoom = selectedRoomIDRef.current === roomID;
           if (prevID && message.id !== prevID && message.user_id !== user.id && !isActiveRoom) {
+            if (!mutedRoomsRef.current[roomID]) {
+              playNotifyTone('message');
+            }
             return { ...prev, [roomID]: (prev[roomID] || 0) + 1 };
           }
           return prev;
@@ -589,6 +665,7 @@ export function App() {
           return latest;
         });
         if (latest.length > 0) {
+          setLastMessagePreviewByRoom((prev) => ({ ...prev, [selectedRoom.id]: previewText(latest[latest.length - 1]) }));
           lastRoomMessageIDsRef.current[selectedRoom.id] = latest[latest.length - 1].id;
         }
         if (!inCall || callRoomIDRef.current !== selectedRoom.id) {
@@ -624,7 +701,7 @@ export function App() {
         const social = await api.listFriends(token);
         if (!mounted) return;
         setFriendsData(social);
-        if (friendsInitRef.current && social.incoming.length > incomingRequestsRef.current && sidebarTabRef.current !== 'friends') {
+        if (friendsInitRef.current && social.incoming.length > incomingRequestsRef.current) {
           playNotifyTone('request');
           setHasNewFriendRequest(true);
         }
@@ -643,18 +720,22 @@ export function App() {
   }, [token]);
 
   useEffect(() => {
-    if (sidebarTab === 'friends') {
-      setHasNewFriendRequest(false);
-    }
-  }, [sidebarTab]);
-
-  useEffect(() => {
     localStorage.setItem('talkie_sidebar_collapsed', sidebarCollapsed ? '1' : '0');
   }, [sidebarCollapsed]);
 
   useEffect(() => {
     localStorage.setItem('talkie_join_with_mic', joinWithMicEnabled ? '1' : '0');
   }, [joinWithMicEnabled]);
+
+  useEffect(() => {
+    if (showFriendsModal) {
+      setHasNewFriendRequest(false);
+    }
+  }, [showFriendsModal]);
+
+  useEffect(() => {
+    localStorage.setItem('talkie_muted_rooms', JSON.stringify(mutedRooms));
+  }, [mutedRooms]);
 
   useEffect(() => {
     audioElsRef.current.forEach(({ participantID, source, el }) => {
@@ -672,6 +753,10 @@ export function App() {
       roomRef.current?.disconnect();
       audioElsRef.current.forEach(({ el }) => el.remove());
       audioElsRef.current.clear();
+      if (audioCtxRef.current) {
+        void audioCtxRef.current.close();
+        audioCtxRef.current = null;
+      }
     };
   }, []);
 
@@ -860,24 +945,13 @@ export function App() {
         await refreshGroups();
         const firstText = group.text_channels[0];
         if (firstText) {
-          const room: AppRoom = {
-            id: firstText.id,
-            name: firstText.name,
-            created_by: firstText.created_by,
-            is_private: firstText.is_private,
-            channel_type: firstText.channel_type,
-            group_id: group.id,
-            position: firstText.position,
-            my_role: firstText.my_role,
-            can_manage: firstText.can_manage,
-            created_at: firstText.created_at,
-          };
+          const room = toAppRoomFromGroupChannel(firstText, group.id);
           await openRoom(room);
         }
       }
       setNewEntityName('');
       setShowCreateGroupModal(false);
-      setSidebarTab('rooms');
+      setSidebarView({ kind: 'root' });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create entity');
     }
@@ -885,6 +959,11 @@ export function App() {
 
   async function openRoom(room: AppRoom) {
     if (!token) return;
+    if (room.group_id) {
+      setSidebarView({ kind: 'group', groupID: room.group_id });
+    } else {
+      setSidebarView({ kind: 'root' });
+    }
     setSelectedRoom(room);
     selectedRoomIDRef.current = room.id;
     setMessages([]);
@@ -905,6 +984,9 @@ export function App() {
       await api.joinRoom(token, room.id);
       const history = await api.listMessages(token, room.id);
       setMessages(history);
+      if (history.length > 0) {
+        setLastMessagePreviewByRoom((prev) => ({ ...prev, [room.id]: previewText(history[history.length - 1]) }));
+      }
       if (history.length > 0) {
         lastRoomMessageIDsRef.current[room.id] = history[history.length - 1].id;
         setRoomActivityByID((prev) => ({
@@ -934,10 +1016,15 @@ export function App() {
           if (payload.type === 'chat' && payload.message) {
             const incomingMessage = payload.message;
             setMessages((prev) => [...prev, incomingMessage]);
+            setLastMessagePreviewByRoom((prev) => ({ ...prev, [room.id]: previewText(incomingMessage) }));
             setRoomActivityByID((prev) => ({ ...prev, [room.id]: new Date(incomingMessage.created_at).getTime() }));
-            if (incomingMessage.user_id !== user?.id && selectedRoomIDRef.current !== room.id) {
-              playNotifyTone('message');
-              setUnreadByRoom((prev) => ({ ...prev, [room.id]: (prev[room.id] || 0) + 1 }));
+            if (incomingMessage.user_id !== user?.id) {
+              if (!mutedRoomsRef.current[room.id]) {
+                playNotifyTone('message');
+              }
+              if (selectedRoomIDRef.current !== room.id) {
+                setUnreadByRoom((prev) => ({ ...prev, [room.id]: (prev[room.id] || 0) + 1 }));
+              }
             }
             lastRoomMessageIDsRef.current[room.id] = incomingMessage.id;
           }
@@ -1001,6 +1088,21 @@ export function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to open room');
     }
+  }
+
+  function openSidebarGroup(group: RoomGroup) {
+    setSidebarView({ kind: 'group', groupID: group.id });
+    const firstChannel = [...group.text_channels, ...group.voice_channels]
+      .slice()
+      .sort((a, b) => a.position - b.position)[0];
+    if (!firstChannel) {
+      setSelectedRoom(null);
+      selectedRoomIDRef.current = null;
+      setMessages([]);
+      return;
+    }
+    if (selectedRoom?.id === firstChannel.id) return;
+    void openRoom(toAppRoomFromGroupChannel(firstChannel, group.id));
   }
 
   function sendChatMessage(e: React.FormEvent) {
@@ -1085,67 +1187,47 @@ export function App() {
     setVideoTracks((prev) => [...prev.filter((item) => item.key !== nextTile.key), nextTile]);
   }
 
-  function playJoinTone() {
+  function ensureAudioContext(): AudioContext | null {
     try {
-      const audioCtx = new window.AudioContext();
-      const oscillator = audioCtx.createOscillator();
-      const gainNode = audioCtx.createGain();
-      oscillator.type = 'triangle';
-      oscillator.frequency.value = 620;
-      gainNode.gain.value = 0.001;
-      oscillator.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
-      const now = audioCtx.currentTime;
-      gainNode.gain.exponentialRampToValueAtTime(0.1, now + 0.02);
-      gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
-      oscillator.start(now);
-      oscillator.stop(now + 0.24);
-      setTimeout(() => void audioCtx.close(), 350);
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new window.AudioContext();
+      }
+      if (audioCtxRef.current.state === 'suspended' && audioUnlockedRef.current) {
+        void audioCtxRef.current.resume();
+      }
+      return audioCtxRef.current;
     } catch {
-      // Best effort sound cue.
+      return null;
     }
+  }
+
+  function playTone(freq: number, peak: number, duration: number, type: OscillatorType) {
+    const audioCtx = ensureAudioContext();
+    if (!audioCtx) return;
+    const oscillator = audioCtx.createOscillator();
+    const gainNode = audioCtx.createGain();
+    oscillator.type = type;
+    oscillator.frequency.value = freq;
+    gainNode.gain.value = 0.0001;
+    oscillator.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
+    const now = audioCtx.currentTime;
+    gainNode.gain.exponentialRampToValueAtTime(peak, now + 0.015);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+    oscillator.start(now);
+    oscillator.stop(now + duration + 0.02);
+  }
+
+  function playJoinTone() {
+    playTone(620, 0.1, 0.24, 'triangle');
   }
 
   function playPresenceTone(kind: 'join' | 'leave') {
-    try {
-      const audioCtx = new window.AudioContext();
-      const oscillator = audioCtx.createOscillator();
-      const gainNode = audioCtx.createGain();
-      oscillator.type = 'triangle';
-      oscillator.frequency.value = kind === 'join' ? 860 : 360;
-      gainNode.gain.value = 0.001;
-      oscillator.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
-      const now = audioCtx.currentTime;
-      gainNode.gain.exponentialRampToValueAtTime(0.18, now + 0.01);
-      gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.24);
-      oscillator.start(now);
-      oscillator.stop(now + 0.26);
-      setTimeout(() => void audioCtx.close(), 420);
-    } catch {
-      // Best effort sound cue.
-    }
+    playTone(kind === 'join' ? 860 : 360, 0.18, 0.24, 'triangle');
   }
 
   function playNotifyTone(kind: 'message' | 'request') {
-    try {
-      const audioCtx = new window.AudioContext();
-      const oscillator = audioCtx.createOscillator();
-      const gainNode = audioCtx.createGain();
-      oscillator.type = 'sine';
-      oscillator.frequency.value = kind === 'message' ? 690 : 520;
-      gainNode.gain.value = 0.001;
-      oscillator.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
-      const now = audioCtx.currentTime;
-      gainNode.gain.exponentialRampToValueAtTime(0.12, now + 0.01);
-      gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
-      oscillator.start(now);
-      oscillator.stop(now + 0.16);
-      setTimeout(() => void audioCtx.close(), 280);
-    } catch {
-      // Best effort sound cue.
-    }
+    playTone(kind === 'message' ? 690 : 520, 0.12, 0.14, 'sine');
   }
 
   function applyRemoteVideoSubscriptions(room: Room) {
@@ -1576,10 +1658,19 @@ export function App() {
       const created = await api.createGroupChannel(token, groupID, name, type);
       await refreshGroups();
       await openRoom(created);
-      setSidebarTab('rooms');
+      setSidebarView({ kind: 'root' });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create channel');
     }
+  }
+
+  function toggleRoomMute(roomID: string) {
+    setMutedRooms((prev) => {
+      const next = { ...prev };
+      if (next[roomID]) delete next[roomID];
+      else next[roomID] = true;
+      return next;
+    });
   }
 
   async function renameGroupPrompt(groupID: string, currentName: string) {
@@ -1779,7 +1870,7 @@ export function App() {
     try {
       const room = await api.openDM(token, userID);
       await refreshSocial();
-      setSidebarTab('rooms');
+      setSidebarView({ kind: 'root' });
       await openRoom(room);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to open dm');
@@ -1807,7 +1898,9 @@ export function App() {
     setActiveCallsByRoom({});
     setUserSearchResults([]);
     setSentFriendRequests({});
-    setSidebarTab('rooms');
+    setLastMessagePreviewByRoom({});
+    setShowFriendsModal(false);
+    setSidebarView({ kind: 'root' });
     callPresenceIDsRef.current = new Set();
     friendsInitRef.current = false;
     incomingRequestsRef.current = 0;
@@ -1939,7 +2032,7 @@ export function App() {
   }
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${!sidebarCollapsed && selectedSidebarGroup ? 'sidebar-with-flyout' : ''}`}>
       <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
         <header className="brand brand-row">
           {!sidebarCollapsed && (
@@ -1955,7 +2048,7 @@ export function App() {
               onClick={() => {
                 setCreateMode('server');
                 setShowCreateGroupModal(true);
-                setSidebarTab('rooms');
+                setSidebarView({ kind: 'root' });
               }}
               title="Создать сервер"
             >
@@ -1975,135 +2068,134 @@ export function App() {
         {!sidebarCollapsed ? (
           <>
             <div className="sidebar-main">
-              <div className="sidebar-tabs">
-                <button className={sidebarTab === 'rooms' ? 'active' : ''} onClick={() => setSidebarTab('rooms')} type="button">
-                  Чаты {hasUnreadChats && <span className="red-dot" />}
-                </button>
-                <button className={sidebarTab === 'friends' ? 'active' : ''} onClick={() => setSidebarTab('friends')} type="button">
-                  Друзья {hasFriendRequestBadge && <span className="red-dot" />}
-                </button>
-              </div>
-              {inCall && activeCallRoom && (
-                <button
-                  type="button"
-                  className="current-call-card"
-                  onClick={() => {
-                    setSidebarTab('rooms');
-                    openRoom(activeCallRoom);
-                  }}
-                  title="Перейти в беседу звонка"
-                >
-                  <small>Сейчас в звонке</small>
-                  <strong>{`${activeCallRoomKind === 'dm' ? '@' : '#'} ${activeCallRoom.name}`}</strong>
-                </button>
-              )}
-
-              {sidebarTab === 'rooms' && (
-                <div className="rooms-panel">
-                  {groups.map((group) => (
-                    <div key={group.id} className="group-block">
-                      <div className="group-head">
-                        <strong>{group.name}</strong>
-                        {group.can_manage && (
-                          <div className="group-actions">
-                            <button type="button" className="ghost" onClick={() => renameGroupPrompt(group.id, group.name)}>
-                              Переименовать
-                            </button>
-                            <button type="button" className="ghost" onClick={() => createChannelInGroup(group.id, 'text')}>
-                              +Текст
-                            </button>
-                            <button type="button" className="ghost" onClick={() => createChannelInGroup(group.id, 'voice')}>
-                              +Голос
-                            </button>
-                          </div>
-                        )}
-                      </div>
-
-                      <small className="group-subtitle">Текст</small>
-                      <ul className="room-list">
-                        {group.text_channels.map((room) => (
-                          <li key={room.id}>
-                            <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
-                              <span className="room-hash">#</span>
-                              <span className="room-name">{room.name}</span>
-                              {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
-                              {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-
-                      <small className="group-subtitle">Голос</small>
-                      <ul className="room-list">
-                        {group.voice_channels.map((room) => (
-                          <li key={room.id}>
-                            <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
-                              <span className="room-hash">V</span>
-                              <span className="room-name">{room.name}</span>
-                              {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
-                              {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  ))}
-
-                  {standaloneRooms.length > 0 && (
-                    <>
-                      <small className="group-subtitle">Обычные группы</small>
-                      <ul className="room-list">
-                        {standaloneRooms.map((room) => (
-                          <li key={room.id}>
-                            <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
-                              <span className="room-hash">#</span>
-                              <span className="room-name">{room.name}</span>
-                              {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
-                              {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    </>
+              <div className={`sidebar-main-layout ${selectedSidebarGroup ? 'with-flyout' : ''}`}>
+                <div className="rooms-panel sidebar-pane">
+                  <div className="sidebar-title-row">
+                    <strong>Чаты</strong>
+                    {hasUnreadChats && <span className="red-dot" />}
+                  </div>
+                  {inCall && activeCallRoom && (
+                    <button
+                      type="button"
+                      className={`current-call-card ${selectedRoom?.id === activeCallRoom.id ? 'active' : ''}`}
+                      onClick={() => {
+                        setSidebarView({ kind: 'root' });
+                        openRoom(activeCallRoom);
+                      }}
+                      title="Перейти в беседу звонка"
+                    >
+                      <span className="chat-kind">ЗВОНОК</span>
+                      <span className="room-main">
+                        <span className="room-name">{`${activeCallRoomKind === 'dm' ? '@' : '#'} ${activeCallRoom.name}`}</span>
+                        <span className="room-preview">
+                          {(activeCallsByRoom[activeCallRoom.id] || 0) > 0
+                            ? `Сейчас в звонке • ${activeCallsByRoom[activeCallRoom.id]} участ.`
+                            : 'Сейчас в звонке'}
+                        </span>
+                      </span>
+                    </button>
                   )}
-
-                  <strong>Личные сообщения</strong>
                   <ul className="room-list">
+                    {groups.map((group) => {
+                      const groupRooms = [...group.text_channels, ...group.voice_channels];
+                      const hasUnread = groupRooms.some((room) => (unreadByRoom[room.id] || 0) > 0);
+                      return (
+                        <li key={group.id}>
+                          <button
+                            type="button"
+                            className={sidebarView.kind === 'group' && sidebarView.groupID === group.id ? 'active' : ''}
+                            onClick={() => openSidebarGroup(group)}
+                          >
+                            <span className="chat-kind">КАНАЛ</span>
+                            <span className="room-name">{group.name}</span>
+                            {hasUnread && <span className="red-dot" />}
+                          </button>
+                        </li>
+                      );
+                    })}
+                    {sortedStandaloneRooms.map((room) => (
+                      <li key={room.id}>
+                        <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
+                          <span className="chat-kind">ГРУППА</span>
+                          <span className="room-main">
+                            <span className="room-name">{room.name}</span>
+                            <span className="room-preview">{lastMessagePreviewByRoom[room.id] || ''}</span>
+                          </span>
+                          {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                        </button>
+                      </li>
+                    ))}
                     {sortedDMRooms.map((room) => (
                       <li key={room.id}>
-                        <button
-                          className={selectedRoom?.id === room.id ? 'active' : ''}
-                          onClick={() => openRoom(room)}
-                        >
-                          <span className="room-hash">@</span>
-                          <span className="room-name">{room.name}</span>
-                          {(activeCallsByRoom[room.id] || 0) > 0 && <span className="room-call-dot" title="Сейчас идет звонок" />}
+                        <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
+                          <span className="chat-kind">ЛС</span>
+                          <span className="room-main">
+                            <span className="room-name">{room.name}</span>
+                            <span className="room-preview">{lastMessagePreviewByRoom[room.id] || ''}</span>
+                          </span>
                           {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
                         </button>
                       </li>
                     ))}
                   </ul>
                 </div>
-              )}
-
-              {sidebarTab === 'friends' && (
-                <FriendsPanel
-                  creatingFriendInvite={creatingFriendInvite}
-                  copyNotice={copyNotice}
-                  friendsData={friendsData}
-                  sentFriendRequests={sentFriendRequests}
-                  userSearchQuery={userSearchQuery}
-                  userSearchResults={userSearchResults}
-                  onAddFriend={(userID) => addFriend(userID)}
-                  onAcceptFriend={(requestID) => acceptFriend(requestID)}
-                  onDeclineFriend={(requestID) => declineFriend(requestID)}
-                  onGenerateFriendInviteLink={() => generateFriendInviteLink()}
-                  onOpenDMWith={(userID) => openDMWith(userID)}
-                  onOpenProfile={(userID, uname) => openMiniProfile(userID, uname)}
-                  onSearchChange={(nextQuery) => setUserSearchQuery(nextQuery)}
-                  onSearchSubmit={handleUserSearch}
-                />
-              )}
+                {selectedSidebarGroup && (
+                  <div className="sidebar-pane secondary-pane">
+                    <div className="group-head">
+                      <strong>{selectedSidebarGroup.name}</strong>
+                      {selectedSidebarGroup.can_manage && (
+                        <div className="group-actions">
+                          <button type="button" className="ghost" onClick={() => renameGroupPrompt(selectedSidebarGroup.id, selectedSidebarGroup.name)}>
+                            Переименовать
+                          </button>
+                          <button type="button" className="ghost" onClick={() => createChannelInGroup(selectedSidebarGroup.id, 'text')}>
+                            +Текст
+                          </button>
+                          <button type="button" className="ghost" onClick={() => createChannelInGroup(selectedSidebarGroup.id, 'voice')}>
+                            +Голос
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    <small className="group-subtitle">Текстовые каналы</small>
+                    <ul className="room-list">
+                      {selectedSidebarGroup.text_channels
+                        .slice()
+                        .sort((a, b) => a.position - b.position)
+                        .map((room) => (
+                          <li key={room.id}>
+                            <button
+                              className={selectedRoom?.id === room.id ? 'active' : ''}
+                              onClick={() => openRoom(toAppRoomFromGroupChannel(room, selectedSidebarGroup.id))}
+                            >
+                              <span className="chat-kind">КАНАЛ</span>
+                              <span className="room-name">{room.name}</span>
+                              {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                            </button>
+                          </li>
+                        ))}
+                    </ul>
+                    <small className="group-subtitle">Голосовые каналы</small>
+                    <ul className="room-list">
+                      {selectedSidebarGroup.voice_channels
+                        .slice()
+                        .sort((a, b) => a.position - b.position)
+                        .map((room) => (
+                          <li key={room.id}>
+                            <button
+                              className={selectedRoom?.id === room.id ? 'active' : ''}
+                              onClick={() => openRoom(toAppRoomFromGroupChannel(room, selectedSidebarGroup.id))}
+                            >
+                              <span className="chat-kind">КАНАЛ</span>
+                              <span className="room-name">{room.name}</span>
+                              {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                            </button>
+                          </li>
+                        ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="sidebar-user">
@@ -2111,6 +2203,9 @@ export function App() {
                 <strong>{user.username}</strong>
                 <small>{user.email}</small>
               </div>
+              <button type="button" className="ghost" onClick={() => setShowFriendsModal(true)}>
+                Друзья {hasNewFriendRequest && <span className="red-dot" />}
+              </button>
               <button className="logout" onClick={logout}>Выйти</button>
             </div>
           </>
@@ -2129,11 +2224,17 @@ export function App() {
                 <div className="media-title">
                   <h3>{selectedRoom.name}</h3>
                   <small>
-                    {canUseCallUI
-                      ? (inCall ? 'Подключено к голосовому каналу' : 'Звонок и чат канала')
-                      : 'Текстовый канал: только сообщения'}
+                    {inCall ? 'Подключено к голосовому каналу' : 'Канал'}
                   </small>
                 </div>
+                <div className="room-header-actions">
+                  <button
+                    type="button"
+                    className={`ghost ${mutedRooms[selectedRoom.id] ? 'danger' : ''}`}
+                    onClick={() => toggleRoomMute(selectedRoom.id)}
+                  >
+                    {mutedRooms[selectedRoom.id] ? 'Включить звук канала' : 'Заглушить канал'}
+                  </button>
                 {!selectedRoomIsDM && (
                   <div className="room-menu-wrap">
                     <button type="button" className="ghost room-menu-btn" onClick={() => setRoomMenuOpen((prev) => !prev)}>
@@ -2152,6 +2253,7 @@ export function App() {
                     )}
                   </div>
                 )}
+                </div>
               </div>
 
               {canUseCallUI ? (
@@ -2225,9 +2327,7 @@ export function App() {
                     </ul>
                   )}
                 </div>
-              ) : (
-                <div className="participant-empty">В текстовом канале звонки отключены</div>
-              )}
+              ) : null}
 
               {canUseCallUI && !inCall ? (
                 <div className="empty-video">Войдите в звонок, чтобы включить аудио и видео.</div>
@@ -2366,12 +2466,7 @@ export function App() {
                   </form>
                   {pendingImage && <small className="pending-file">Изображение прикреплено</small>}
                 </section>
-              ) : (
-                <section className="chat-panel">
-                  <div className="panel-heading">Чат канала</div>
-                  <div className="participant-empty">В голосовом канале текстовый чат отключен</div>
-                </section>
-              )}
+              ) : null}
 
               {!selectedRoomIsDM && (
                 <section className="members-panel">
@@ -2431,6 +2526,30 @@ export function App() {
           </>
         )}
         {error && <p className="error global">{error}</p>}
+        {showFriendsModal && (
+          <div className="mini-profile-overlay" onClick={() => setShowFriendsModal(false)} role="button" tabIndex={0}>
+            <div className="mini-profile-card friends-modal" onClick={(e) => e.stopPropagation()}>
+              <h4>Друзья</h4>
+              <FriendsPanel
+                creatingFriendInvite={creatingFriendInvite}
+                copyNotice={copyNotice}
+                friendsData={friendsData}
+                sentFriendRequests={sentFriendRequests}
+                userSearchQuery={userSearchQuery}
+                userSearchResults={userSearchResults}
+                onAddFriend={(userID) => addFriend(userID)}
+                onAcceptFriend={(requestID) => acceptFriend(requestID)}
+                onDeclineFriend={(requestID) => declineFriend(requestID)}
+                onGenerateFriendInviteLink={() => generateFriendInviteLink()}
+                onOpenDMWith={(userID) => openDMWith(userID)}
+                onOpenProfile={(userID, uname) => openMiniProfile(userID, uname)}
+                onSearchChange={(nextQuery) => setUserSearchQuery(nextQuery)}
+                onSearchSubmit={handleUserSearch}
+              />
+              <button type="button" className="ghost" onClick={() => setShowFriendsModal(false)}>Закрыть</button>
+            </div>
+          </div>
+        )}
         {miniProfile && (
           <div className="mini-profile-overlay" onClick={() => setMiniProfile(null)} role="button" tabIndex={0}>
             <div className="mini-profile-card" onClick={(e) => e.stopPropagation()}>
