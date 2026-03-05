@@ -294,6 +294,7 @@ export function App() {
   );
   const selectedRoomCanManage = Boolean(selectedRoom?.can_manage);
   const selectedRoomChannelType = selectedRoom?.channel_type || '';
+  const selectedRoomInGroup = Boolean(selectedRoom?.group_id);
   const selectedRoomIsTextOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'text');
   const selectedRoomIsVoiceOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'voice');
   const canUseCallUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsVoiceOnly || !selectedRoomChannelType));
@@ -309,6 +310,8 @@ export function App() {
     () => (sidebarView.kind === 'group' ? groups.find((group) => group.id === sidebarView.groupID) || null : null),
     [sidebarView, groups],
   );
+  const showRightInviteLinkButton = Boolean(!selectedRoomIsDM && !selectedSidebarGroup && !selectedRoomInGroup);
+  const showRightInvitePanel = Boolean(!selectedRoomIsDM && !selectedSidebarGroup && !selectedRoomInGroup);
 
   function videoKey(participantID: string, source: Track.Source, sid?: string): string {
     return sid || `${participantID}-${source}`;
@@ -433,7 +436,8 @@ export function App() {
         setRooms(mergedRooms);
         setDMRooms(dms);
         setRoomActivityByID((prev) => ({ ...prev, [room.id]: Date.now() }));
-        await openRoom(room);
+        const resolvedRoom = [...mergedRooms, ...dms].find((candidate) => candidate.id === room.id) || room;
+        await openRoom(resolvedRoom);
       })
       .catch((err) => {
         if (!mounted) return;
@@ -1731,6 +1735,30 @@ export function App() {
     }
   }
 
+  async function generateGroupInviteLink(group: RoomGroup) {
+    if (!token) return;
+    const anchorChannel = [...group.text_channels, ...group.voice_channels]
+      .slice()
+      .sort((a, b) => a.position - b.position)[0];
+    if (!anchorChannel) return;
+
+    setGeneratingInviteLink(true);
+    setCopyNotice(null);
+    try {
+      const result = await api.createInviteLink(token, anchorChannel.id);
+      const copied = await copyText(result.invite_url);
+      if (copied) {
+        setCopyNotice('Ссылка на канал скопирована');
+      } else {
+        window.prompt('Скопируйте ссылку вручную:', result.invite_url);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to create channel invite link');
+    } finally {
+      setGeneratingInviteLink(false);
+    }
+  }
+
   async function generateFriendInviteLink() {
     if (!token) return;
     setCreatingFriendInvite(true);
@@ -1999,7 +2027,7 @@ export function App() {
             {authView === 'register' && (
               <label>
                 Username
-                <input value={username} onChange={(e) => setUsername(e.target.value)} required />
+                <input value={username} onChange={(e) => setUsername(e.target.value.slice(0, 15))} maxLength={15} required />
               </label>
             )}
             <label>
@@ -2074,28 +2102,30 @@ export function App() {
                     <strong>Чаты</strong>
                     {hasUnreadChats && <span className="red-dot" />}
                   </div>
-                  {inCall && activeCallRoom && (
-                    <button
-                      type="button"
-                      className={`current-call-card ${selectedRoom?.id === activeCallRoom.id ? 'active' : ''}`}
-                      onClick={() => {
-                        setSidebarView({ kind: 'root' });
-                        openRoom(activeCallRoom);
-                      }}
-                      title="Перейти в беседу звонка"
-                    >
-                      <span className="chat-kind">ЗВОНОК</span>
-                      <span className="room-main">
-                        <span className="room-name">{`${activeCallRoomKind === 'dm' ? '@' : '#'} ${activeCallRoom.name}`}</span>
-                        <span className="room-preview">
-                          {(activeCallsByRoom[activeCallRoom.id] || 0) > 0
-                            ? `Сейчас в звонке • ${activeCallsByRoom[activeCallRoom.id]} участ.`
-                            : 'Сейчас в звонке'}
-                        </span>
-                      </span>
-                    </button>
-                  )}
                   <ul className="room-list">
+                    {inCall && activeCallRoom && (
+                      <li key={`active-call-${activeCallRoom.id}`}>
+                        <button
+                          type="button"
+                          className={`current-call-card ${selectedRoom?.id === activeCallRoom.id ? 'active' : ''}`}
+                          onClick={() => {
+                            setSidebarView({ kind: 'root' });
+                            openRoom(activeCallRoom);
+                          }}
+                          title="Перейти в беседу звонка"
+                        >
+                          <span className="chat-kind kind-call">ЗВОНОК</span>
+                          <span className="room-main">
+                            <span className="room-name">{`${activeCallRoomKind === 'dm' ? '@' : '#'} ${activeCallRoom.name}`}</span>
+                            <span className="room-preview">
+                              {(activeCallsByRoom[activeCallRoom.id] || 0) > 0
+                                ? `Сейчас в звонке • ${activeCallsByRoom[activeCallRoom.id]} участ.`
+                                : 'Сейчас в звонке'}
+                            </span>
+                          </span>
+                        </button>
+                      </li>
+                    )}
                     {groups.map((group) => {
                       const groupRooms = [...group.text_channels, ...group.voice_channels];
                       const hasUnread = groupRooms.some((room) => (unreadByRoom[room.id] || 0) > 0);
@@ -2106,7 +2136,7 @@ export function App() {
                             className={sidebarView.kind === 'group' && sidebarView.groupID === group.id ? 'active' : ''}
                             onClick={() => openSidebarGroup(group)}
                           >
-                            <span className="chat-kind">КАНАЛ</span>
+                            <span className="chat-kind kind-channel">КАНАЛ</span>
                             <span className="room-name">{group.name}</span>
                             {hasUnread && <span className="red-dot" />}
                           </button>
@@ -2116,7 +2146,7 @@ export function App() {
                     {sortedStandaloneRooms.map((room) => (
                       <li key={room.id}>
                         <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
-                          <span className="chat-kind">ГРУППА</span>
+                          <span className="chat-kind kind-group">ГРУППА</span>
                           <span className="room-main">
                             <span className="room-name">{room.name}</span>
                             <span className="room-preview">{lastMessagePreviewByRoom[room.id] || ''}</span>
@@ -2128,7 +2158,7 @@ export function App() {
                     {sortedDMRooms.map((room) => (
                       <li key={room.id}>
                         <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
-                          <span className="chat-kind">ЛС</span>
+                          <span className="chat-kind kind-dm">ЛС</span>
                           <span className="room-main">
                             <span className="room-name">{room.name}</span>
                             <span className="room-preview">{lastMessagePreviewByRoom[room.id] || ''}</span>
@@ -2157,6 +2187,17 @@ export function App() {
                         </div>
                       )}
                     </div>
+                    <div className="flyout-tools">
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        onClick={() => generateGroupInviteLink(selectedSidebarGroup)}
+                        disabled={generatingInviteLink}
+                      >
+                        {generatingInviteLink ? 'Создаем...' : 'Ссылка-приглашение в канал'}
+                      </button>
+                      {copyNotice && <small className="copy-notice">{copyNotice}</small>}
+                    </div>
                     <small className="group-subtitle">Текстовые каналы</small>
                     <ul className="room-list">
                       {selectedSidebarGroup.text_channels
@@ -2168,7 +2209,7 @@ export function App() {
                               className={selectedRoom?.id === room.id ? 'active' : ''}
                               onClick={() => openRoom(toAppRoomFromGroupChannel(room, selectedSidebarGroup.id))}
                             >
-                              <span className="chat-kind">КАНАЛ</span>
+                              <span className="chat-kind kind-channel">КАНАЛ</span>
                               <span className="room-name">{room.name}</span>
                               {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
                             </button>
@@ -2186,7 +2227,7 @@ export function App() {
                               className={selectedRoom?.id === room.id ? 'active' : ''}
                               onClick={() => openRoom(toAppRoomFromGroupChannel(room, selectedSidebarGroup.id))}
                             >
-                              <span className="chat-kind">КАНАЛ</span>
+                              <span className="chat-kind kind-channel">КАНАЛ</span>
                               <span className="room-name">{room.name}</span>
                               {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
                             </button>
@@ -2203,10 +2244,12 @@ export function App() {
                 <strong>{user.username}</strong>
                 <small>{user.email}</small>
               </div>
-              <button type="button" className="ghost" onClick={() => setShowFriendsModal(true)}>
-                Друзья {hasNewFriendRequest && <span className="red-dot" />}
-              </button>
-              <button className="logout" onClick={logout}>Выйти</button>
+              <div className="sidebar-user-actions">
+                <button type="button" className="ghost sidebar-user-btn" onClick={() => setShowFriendsModal(true)}>
+                  <span>Друзья</span> {hasNewFriendRequest && <span className="red-dot" />}
+                </button>
+                <button className="logout sidebar-user-btn" onClick={logout}>Выйти</button>
+              </div>
             </div>
           </>
         ) : (
@@ -2413,7 +2456,7 @@ export function App() {
 
             </section>
 
-            <div className="bottom-row">
+            <div className={`bottom-row ${selectedRoomIsDM ? 'dm-layout' : ''}`}>
               {canUseChatUI ? (
                 <section className="chat-panel">
                   <div className="panel-heading">Чат канала</div>
@@ -2470,39 +2513,39 @@ export function App() {
 
               {!selectedRoomIsDM && (
                 <section className="members-panel">
-                <div className="participants invite-panel">
-                  <strong>Приглашения</strong>
-                  {selectedRoomIsDM ? (
-                    <small>В личные сообщения нельзя приглашать по ссылке.</small>
-                  ) : (
-                    <>
-                      <button type="button" onClick={generateInviteLink} disabled={generatingInviteLink}>
-                        {generatingInviteLink ? 'Создаем...' : 'Быстрая invite-ссылка'}
-                      </button>
-                      {copyNotice && <small className="copy-notice">{copyNotice}</small>}
-                    </>
-                  )}
-                  <form onSubmit={handleInviteSearch} className="invite-form">
-                    <input
-                      placeholder="Найти пользователя по имени/email"
-                      value={inviteQuery}
-                      onChange={(e) => setInviteQuery(e.target.value)}
-                    />
-                    <button type="submit">Найти</button>
-                  </form>
-                  {inviteResults.length > 0 && (
-                    <ul className="participant-list">
-                      {inviteResults.map((candidate) => (
-                        <li key={candidate.id}>
-                          <span className="participant-name">{candidate.username}</span>
-                          <button type="button" onClick={() => inviteUserToRoom(candidate.id)}>
-                            Пригласить
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
+                {showRightInvitePanel && (
+                  <div className="participants invite-panel">
+                    <strong>Приглашения</strong>
+                    {showRightInviteLinkButton && (
+                      <>
+                        <button type="button" onClick={generateInviteLink} disabled={generatingInviteLink}>
+                          {generatingInviteLink ? 'Создаем...' : 'Быстрая invite-ссылка'}
+                        </button>
+                        {copyNotice && <small className="copy-notice">{copyNotice}</small>}
+                      </>
+                    )}
+                    <form onSubmit={handleInviteSearch} className="invite-form">
+                      <input
+                        placeholder="Найти пользователя по имени/email"
+                        value={inviteQuery}
+                        onChange={(e) => setInviteQuery(e.target.value)}
+                      />
+                      <button type="submit">Найти</button>
+                    </form>
+                    {inviteResults.length > 0 && (
+                      <ul className="participant-list">
+                        {inviteResults.map((candidate) => (
+                          <li key={candidate.id}>
+                            <span className="participant-name">{candidate.username}</span>
+                            <button type="button" onClick={() => inviteUserToRoom(candidate.id)}>
+                              Пригласить
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
                 <div className="participants">
                   <strong>В чате</strong>
                   {chatParticipants.length === 0 ? (

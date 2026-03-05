@@ -12,6 +12,7 @@ import (
 	"net/smtp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"talkie/backend/internal/auth"
 	"talkie/backend/internal/config"
@@ -113,6 +114,10 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Password) < 6 {
 		jsonError(w, http.StatusBadRequest, "password must be at least 6 characters")
+		return
+	}
+	if utf8.RuneCountInString(req.Username) > 15 {
+		jsonError(w, http.StatusBadRequest, "username must be at most 15 characters")
 		return
 	}
 

@@ -87,6 +87,7 @@ type RoomMember struct {
 type RoomInviteLink struct {
 	TokenHash string
 	RoomID    uuid.UUID
+	GroupID   uuid.UUID
 	CreatedBy uuid.UUID
 	CreatedAt time.Time
 	ExpiresAt time.Time
@@ -1036,32 +1037,130 @@ func (s *Store) FindRoomInviteLinkByCreator(ctx context.Context, roomID, created
 	return token, expiresAt, nil
 }
 
+func (s *Store) FindGroupInviteLinkByCreator(ctx context.Context, groupID, createdBy uuid.UUID) (string, time.Time, error) {
+	var token string
+	var expiresAt time.Time
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT token, expires_at
+		FROM room_invite_links
+		WHERE group_id = $1
+		  AND created_by = $2
+		  AND token IS NOT NULL
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, groupID, createdBy).Scan(&token, &expiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", time.Time{}, ErrNotFound
+		}
+		return "", time.Time{}, err
+	}
+	return token, expiresAt, nil
+}
+
 func (s *Store) CreateRoomInviteLink(ctx context.Context, rawToken, tokenHash string, roomID, createdBy uuid.UUID, expiresAt time.Time) error {
 	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO room_invite_links (token, token_hash, room_id, created_by, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO room_invite_links (token, token_hash, room_id, group_id, created_by, expires_at)
+		VALUES ($1, $2, $3, NULL, $4, $5)
 	`, rawToken, tokenHash, roomID, createdBy, expiresAt)
 	return err
 }
 
-func (s *Store) JoinRoomByInviteTokenHash(ctx context.Context, tokenHash string, userID uuid.UUID) (uuid.UUID, error) {
-	var roomID uuid.UUID
+func (s *Store) CreateGroupInviteLink(ctx context.Context, rawToken, tokenHash string, groupID, createdBy uuid.UUID, expiresAt time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `
+		INSERT INTO room_invite_links (token, token_hash, room_id, group_id, created_by, expires_at)
+		VALUES ($1, $2, NULL, $3, $4, $5)
+	`, rawToken, tokenHash, groupID, createdBy, expiresAt)
+	return err
+}
+
+func (s *Store) GetGroupIDByRoomID(ctx context.Context, roomID uuid.UUID) (uuid.UUID, error) {
+	var groupID uuid.UUID
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT room_id
-		FROM room_invite_links
-		WHERE token_hash = $1
-		  AND expires_at > NOW()
-	`, tokenHash).Scan(&roomID)
+		SELECT group_id
+		FROM group_channels
+		WHERE room_id = $1
+	`, roomID).Scan(&groupID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return uuid.Nil, ErrNotFound
 		}
 		return uuid.Nil, err
 	}
-	if err := s.JoinRoom(ctx, roomID, userID); err != nil {
+	return groupID, nil
+}
+
+func (s *Store) JoinRoomByInviteTokenHash(ctx context.Context, tokenHash string, userID uuid.UUID) (uuid.UUID, error) {
+	var roomIDText sql.NullString
+	var groupIDText sql.NullString
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT room_id::text, group_id::text
+		FROM room_invite_links
+		WHERE token_hash = $1
+		  AND expires_at > NOW()
+	`, tokenHash).Scan(&roomIDText, &groupIDText)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return uuid.Nil, ErrNotFound
+		}
 		return uuid.Nil, err
 	}
-	return roomID, nil
+
+	if roomIDText.Valid {
+		roomID, parseErr := uuid.Parse(roomIDText.String)
+		if parseErr != nil {
+			return uuid.Nil, parseErr
+		}
+		if err := s.JoinRoom(ctx, roomID, userID); err != nil {
+			return uuid.Nil, err
+		}
+		return roomID, nil
+	}
+
+	if !groupIDText.Valid {
+		return uuid.Nil, ErrNotFound
+	}
+	groupID, parseErr := uuid.Parse(groupIDText.String)
+	if parseErr != nil {
+		return uuid.Nil, parseErr
+	}
+
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT gc.room_id
+		FROM group_channels gc
+		JOIN rooms r ON r.id = gc.room_id
+		LEFT JOIN direct_rooms d ON d.room_id = r.id
+		WHERE gc.group_id = $1
+		  AND d.room_id IS NULL
+		ORDER BY CASE WHEN gc.channel_type = 'text' THEN 0 ELSE 1 END, gc.position ASC, r.created_at ASC
+	`, groupID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	defer rows.Close()
+
+	var firstRoomID uuid.UUID
+	found := false
+	for rows.Next() {
+		var channelRoomID uuid.UUID
+		if err := rows.Scan(&channelRoomID); err != nil {
+			return uuid.Nil, err
+		}
+		if !found {
+			firstRoomID = channelRoomID
+			found = true
+		}
+		if err := s.JoinRoom(ctx, channelRoomID, userID); err != nil {
+			return uuid.Nil, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return uuid.Nil, err
+	}
+	if !found {
+		return uuid.Nil, ErrNotFound
+	}
+	return firstRoomID, nil
 }
 
 func (s *Store) FindFriendInviteLinkByCreator(ctx context.Context, createdBy uuid.UUID) (string, time.Time, error) {

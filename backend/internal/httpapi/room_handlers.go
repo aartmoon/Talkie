@@ -148,6 +148,42 @@ func (s *Server) createRoomInviteLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	groupID, groupErr := s.Store.GetGroupIDByRoomID(r.Context(), roomID)
+	if groupErr == nil {
+		if token, expiresAt, err := s.Store.FindGroupInviteLinkByCreator(r.Context(), groupID, user.ID); err == nil {
+			jsonResponse(w, http.StatusOK, map[string]string{
+				"token":      token,
+				"invite_url": fmt.Sprintf("%s?invite=%s", strings.TrimRight(s.Cfg.FrontendBaseURL, "/"), token),
+				"expires_at": expiresAt.Format(time.RFC3339),
+			})
+			return
+		} else if err != db.ErrNotFound {
+			jsonError(w, http.StatusInternalServerError, "failed to load invite link")
+			return
+		}
+
+		rawToken, err := randomToken(24)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to create invite link")
+			return
+		}
+		expiresAt := time.Now().UTC().Add(10 * 365 * 24 * time.Hour)
+		if err := s.Store.CreateGroupInviteLink(r.Context(), rawToken, tokenHash(rawToken), groupID, user.ID, expiresAt); err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to store invite link")
+			return
+		}
+
+		jsonResponse(w, http.StatusCreated, map[string]string{
+			"token":      rawToken,
+			"invite_url": fmt.Sprintf("%s?invite=%s", strings.TrimRight(s.Cfg.FrontendBaseURL, "/"), rawToken),
+			"expires_at": expiresAt.Format(time.RFC3339),
+		})
+		return
+	} else if groupErr != db.ErrNotFound {
+		jsonError(w, http.StatusInternalServerError, "failed to detect invite target")
+		return
+	}
+
 	if token, expiresAt, err := s.Store.FindRoomInviteLinkByCreator(r.Context(), roomID, user.ID); err == nil {
 		jsonResponse(w, http.StatusOK, map[string]string{
 			"token":      token,
