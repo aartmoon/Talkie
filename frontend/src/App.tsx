@@ -976,9 +976,11 @@ export function App() {
   async function refreshGroups() {
     if (!token) return;
     try {
-      const [list, roomList] = await Promise.all([api.listGroups(token), api.listRooms(token)]);
-      const flatRooms = mergeGroupedAndStandalone(list, roomList);
-      setGroups(list);
+      const [groupsResult, roomsResult] = await Promise.allSettled([api.listGroups(token), api.listRooms(token)]);
+      const nextGroups = groupsResult.status === 'fulfilled' ? groupsResult.value : groups;
+      const nextRooms = roomsResult.status === 'fulfilled' ? roomsResult.value : rooms;
+      const flatRooms = mergeGroupedAndStandalone(nextGroups, nextRooms);
+      setGroups(nextGroups);
       setRooms(flatRooms);
       setRoomActivityByID((prev) => {
         const next = { ...prev };
@@ -995,6 +997,14 @@ export function App() {
   async function createStandaloneRoom(name: string) {
     if (!token) return;
     const room = await api.createRoom(token, name);
+    setRooms((prev) => {
+      if (prev.some((r) => r.id === room.id)) return prev;
+      return [...prev, room];
+    });
+    setRoomActivityByID((prev) => ({
+      ...prev,
+      [room.id]: prev[room.id] || new Date(room.created_at).getTime(),
+    }));
     await refreshGroups();
     await openRoom(room);
   }
