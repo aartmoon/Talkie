@@ -20,25 +20,27 @@ type Store struct {
 }
 
 type User struct {
-	ID           uuid.UUID `json:"id"`
-	Email        string    `json:"email"`
-	Username     string    `json:"username"`
-	EmailVerified bool     `json:"email_verified"`
+	ID            uuid.UUID `json:"id"`
+	Email         string    `json:"email"`
+	Username      string    `json:"username"`
+	AvatarURL     string    `json:"avatar_url,omitempty"`
+	EmailVerified bool      `json:"email_verified"`
 	PasswordHash string
-	CreatedAt    time.Time `json:"created_at"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type Room struct {
-	ID        uuid.UUID `json:"id"`
-	Name      string    `json:"name"`
-	CreatedBy uuid.UUID `json:"created_by"`
-	IsPrivate bool      `json:"is_private"`
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	CreatedBy   uuid.UUID `json:"created_by"`
+	AvatarURL   string    `json:"avatar_url,omitempty"`
+	IsPrivate   bool      `json:"is_private"`
 	ChannelType string  `json:"channel_type,omitempty"`
-	GroupID   uuid.UUID `json:"group_id,omitempty"`
-	Position  int       `json:"position,omitempty"`
-	MyRole    string    `json:"my_role,omitempty"`
-	CanManage bool      `json:"can_manage,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	GroupID     uuid.UUID `json:"group_id,omitempty"`
+	Position    int       `json:"position,omitempty"`
+	MyRole      string    `json:"my_role,omitempty"`
+	CanManage   bool      `json:"can_manage,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type GroupChannel struct {
@@ -64,24 +66,28 @@ type RoomGroup struct {
 }
 
 type Friend struct {
-	ID       uuid.UUID `json:"id"`
-	Username string    `json:"username"`
-	Email    string    `json:"email"`
+	ID        uuid.UUID `json:"id"`
+	Username  string    `json:"username"`
+	Email     string    `json:"email"`
+	AvatarURL string    `json:"avatar_url,omitempty"`
 }
 
 type FriendRequest struct {
-	ID          int64     `json:"id"`
-	RequesterID uuid.UUID `json:"requester_id"`
-	AddresseeID uuid.UUID `json:"addressee_id"`
-	Requester   string    `json:"requester_username"`
-	Addressee   string    `json:"addressee_username"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID               int64     `json:"id"`
+	RequesterID      uuid.UUID `json:"requester_id"`
+	AddresseeID      uuid.UUID `json:"addressee_id"`
+	Requester        string    `json:"requester_username"`
+	RequesterAvatar  string    `json:"requester_avatar_url,omitempty"`
+	Addressee        string    `json:"addressee_username"`
+	AddresseeAvatar  string    `json:"addressee_avatar_url,omitempty"`
+	Status           string    `json:"status"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type RoomMember struct {
-	ID       uuid.UUID `json:"id"`
-	Username string    `json:"username"`
+	ID        uuid.UUID `json:"id"`
+	Username  string    `json:"username"`
+	AvatarURL string    `json:"avatar_url,omitempty"`
 }
 
 type RoomInviteLink struct {
@@ -98,6 +104,7 @@ type Message struct {
 	RoomID      uuid.UUID `json:"room_id"`
 	UserID      uuid.UUID `json:"user_id"`
 	Username    string    `json:"username"`
+	AvatarURL   string    `json:"avatar_url,omitempty"`
 	Content     string    `json:"content"`
 	MessageType string    `json:"message_type"`
 	MediaURL    string    `json:"media_url,omitempty"`
@@ -130,11 +137,11 @@ func (s *Store) CreateUser(ctx context.Context, email, username, passwordHash st
 	query := `
 		INSERT INTO users (email, username, password_hash, email_verified)
 		VALUES ($1, $2, $3, FALSE)
-		RETURNING id, email, username, email_verified, password_hash, created_at
+		RETURNING id, email, username, COALESCE(avatar_url, ''), email_verified, password_hash, created_at
 	`
 	var u User
 	err := s.DB.QueryRowContext(ctx, query, email, username, passwordHash).
-		Scan(&u.ID, &u.Email, &u.Username, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
+		Scan(&u.ID, &u.Email, &u.Username, &u.AvatarURL, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
 		return User{}, err
 	}
@@ -142,10 +149,10 @@ func (s *Store) CreateUser(ctx context.Context, email, username, passwordHash st
 }
 
 func (s *Store) FindUserByEmail(ctx context.Context, email string) (User, error) {
-	query := `SELECT id, email, username, email_verified, password_hash, created_at FROM users WHERE email = $1`
+	query := `SELECT id, email, username, COALESCE(avatar_url, ''), email_verified, password_hash, created_at FROM users WHERE email = $1`
 	var u User
 	err := s.DB.QueryRowContext(ctx, query, email).
-		Scan(&u.ID, &u.Email, &u.Username, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
+		Scan(&u.ID, &u.Email, &u.Username, &u.AvatarURL, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
@@ -156,10 +163,10 @@ func (s *Store) FindUserByEmail(ctx context.Context, email string) (User, error)
 }
 
 func (s *Store) FindUserByID(ctx context.Context, id uuid.UUID) (User, error) {
-	query := `SELECT id, email, username, email_verified, password_hash, created_at FROM users WHERE id = $1`
+	query := `SELECT id, email, username, COALESCE(avatar_url, ''), email_verified, password_hash, created_at FROM users WHERE id = $1`
 	var u User
 	err := s.DB.QueryRowContext(ctx, query, id).
-		Scan(&u.ID, &u.Email, &u.Username, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
+		Scan(&u.ID, &u.Email, &u.Username, &u.AvatarURL, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
@@ -475,8 +482,8 @@ func (s *Store) EnsureRoomExists(ctx context.Context, roomID uuid.UUID) error {
 
 func (s *Store) GetRoomByID(ctx context.Context, roomID uuid.UUID) (Room, error) {
 	var r Room
-	err := s.DB.QueryRowContext(ctx, `SELECT id, name, created_by, is_private, created_at FROM rooms WHERE id = $1`, roomID).
-		Scan(&r.ID, &r.Name, &r.CreatedBy, &r.IsPrivate, &r.CreatedAt)
+	err := s.DB.QueryRowContext(ctx, `SELECT id, name, created_by, '' AS avatar_url, is_private, created_at FROM rooms WHERE id = $1`, roomID).
+		Scan(&r.ID, &r.Name, &r.CreatedBy, &r.AvatarURL, &r.IsPrivate, &r.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Room{}, ErrNotFound
@@ -507,11 +514,11 @@ func (s *Store) IsRoomAdmin(ctx context.Context, roomID, userID uuid.UUID) (bool
 func (s *Store) GetRoomForUser(ctx context.Context, roomID, userID uuid.UUID) (Room, error) {
 	var r Room
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT r.id, r.name, r.created_by, r.is_private, rm.role, (rm.role = 'admin') AS can_manage, r.created_at
+		SELECT r.id, r.name, r.created_by, '' AS avatar_url, r.is_private, rm.role, (rm.role = 'admin') AS can_manage, r.created_at
 		FROM rooms r
 		JOIN room_members rm ON rm.room_id = r.id
 		WHERE r.id = $1 AND rm.user_id = $2
-	`, roomID, userID).Scan(&r.ID, &r.Name, &r.CreatedBy, &r.IsPrivate, &r.MyRole, &r.CanManage, &r.CreatedAt)
+	`, roomID, userID).Scan(&r.ID, &r.Name, &r.CreatedBy, &r.AvatarURL, &r.IsPrivate, &r.MyRole, &r.CanManage, &r.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Room{}, ErrNotFound
@@ -600,7 +607,7 @@ func (s *Store) IsDirectRoom(ctx context.Context, roomID uuid.UUID) (bool, error
 
 func (s *Store) ListRoomMembers(ctx context.Context, roomID uuid.UUID) ([]RoomMember, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT u.id, u.username
+		SELECT u.id, u.username, COALESCE(u.avatar_url, '')
 		FROM room_members rm
 		JOIN users u ON u.id = rm.user_id
 		WHERE rm.room_id = $1
@@ -614,7 +621,7 @@ func (s *Store) ListRoomMembers(ctx context.Context, roomID uuid.UUID) ([]RoomMe
 	out := make([]RoomMember, 0)
 	for rows.Next() {
 		var m RoomMember
-		if err := rows.Scan(&m.ID, &m.Username); err != nil {
+		if err := rows.Scan(&m.ID, &m.Username, &m.AvatarURL); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -627,7 +634,7 @@ func (s *Store) SearchUsers(ctx context.Context, selfID uuid.UUID, q string, lim
 		limit = 10
 	}
 	query := `
-		SELECT id, username, email
+		SELECT id, username, email, COALESCE(avatar_url, '')
 		FROM users
 		WHERE id <> $1 AND (username ILIKE $2 OR email ILIKE $2)
 		ORDER BY username ASC
@@ -641,7 +648,7 @@ func (s *Store) SearchUsers(ctx context.Context, selfID uuid.UUID, q string, lim
 	out := make([]Friend, 0)
 	for rows.Next() {
 		var f Friend
-		if err := rows.Scan(&f.ID, &f.Username, &f.Email); err != nil {
+		if err := rows.Scan(&f.ID, &f.Username, &f.Email, &f.AvatarURL); err != nil {
 			return nil, err
 		}
 		out = append(out, f)
@@ -651,7 +658,7 @@ func (s *Store) SearchUsers(ctx context.Context, selfID uuid.UUID, q string, lim
 
 func (s *Store) ListFriends(ctx context.Context, userID uuid.UUID) ([]Friend, error) {
 	query := `
-		SELECT u.id, u.username, u.email
+		SELECT u.id, u.username, u.email, COALESCE(u.avatar_url, '')
 		FROM friendships f
 		JOIN users u ON u.id = f.friend_id
 		WHERE f.user_id = $1
@@ -665,7 +672,7 @@ func (s *Store) ListFriends(ctx context.Context, userID uuid.UUID) ([]Friend, er
 	out := make([]Friend, 0)
 	for rows.Next() {
 		var f Friend
-		if err := rows.Scan(&f.ID, &f.Username, &f.Email); err != nil {
+		if err := rows.Scan(&f.ID, &f.Username, &f.Email, &f.AvatarURL); err != nil {
 			return nil, err
 		}
 		out = append(out, f)
@@ -683,7 +690,7 @@ func (s *Store) IsFriend(ctx context.Context, userID, targetID uuid.UUID) (bool,
 
 func (s *Store) ListIncomingFriendRequests(ctx context.Context, userID uuid.UUID) ([]FriendRequest, error) {
 	query := `
-		SELECT fr.id, fr.requester_id, fr.addressee_id, ru.username, au.username, fr.status, fr.created_at
+		SELECT fr.id, fr.requester_id, fr.addressee_id, ru.username, COALESCE(ru.avatar_url, ''), au.username, COALESCE(au.avatar_url, ''), fr.status, fr.created_at
 		FROM friend_requests fr
 		JOIN users ru ON ru.id = fr.requester_id
 		JOIN users au ON au.id = fr.addressee_id
@@ -698,7 +705,7 @@ func (s *Store) ListIncomingFriendRequests(ctx context.Context, userID uuid.UUID
 	out := make([]FriendRequest, 0)
 	for rows.Next() {
 		var fr FriendRequest
-		if err := rows.Scan(&fr.ID, &fr.RequesterID, &fr.AddresseeID, &fr.Requester, &fr.Addressee, &fr.Status, &fr.CreatedAt); err != nil {
+		if err := rows.Scan(&fr.ID, &fr.RequesterID, &fr.AddresseeID, &fr.Requester, &fr.RequesterAvatar, &fr.Addressee, &fr.AddresseeAvatar, &fr.Status, &fr.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, fr)
@@ -866,7 +873,9 @@ func (s *Store) ListDirectRoomsForUser(ctx context.Context, userID uuid.UUID) ([
 	query := `
 		SELECT r.id,
 		       CASE WHEN d.user_a = $1 THEN ub.username ELSE ua.username END AS dm_name,
-		       r.created_by, r.is_private, rm.role, (rm.role = 'admin') AS can_manage, r.created_at
+		       r.created_by,
+		       CASE WHEN d.user_a = $1 THEN COALESCE(ub.avatar_url, '') ELSE COALESCE(ua.avatar_url, '') END AS dm_avatar_url,
+		       r.is_private, rm.role, (rm.role = 'admin') AS can_manage, r.created_at
 		FROM rooms r
 		JOIN direct_rooms d ON d.room_id = r.id
 		JOIN room_members rm ON rm.room_id = r.id AND rm.user_id = $1
@@ -883,7 +892,7 @@ func (s *Store) ListDirectRoomsForUser(ctx context.Context, userID uuid.UUID) ([
 	out := make([]Room, 0)
 	for rows.Next() {
 		var r Room
-		if err := rows.Scan(&r.ID, &r.Name, &r.CreatedBy, &r.IsPrivate, &r.MyRole, &r.CanManage, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.CreatedBy, &r.AvatarURL, &r.IsPrivate, &r.MyRole, &r.CanManage, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -916,6 +925,7 @@ func (s *Store) SaveMessageWithType(ctx context.Context, roomID, userID uuid.UUI
 		return Message{}, err
 	}
 	m.Username = u.Username
+	m.AvatarURL = u.AvatarURL
 	return m, nil
 }
 
@@ -924,7 +934,7 @@ func (s *Store) ListMessages(ctx context.Context, roomID uuid.UUID, limit int) (
 		limit = 50
 	}
 	query := `
-		SELECT m.id, m.room_id, m.user_id, u.username, m.content, m.message_type, COALESCE(m.media_url, ''), m.created_at
+		SELECT m.id, m.room_id, m.user_id, u.username, COALESCE(u.avatar_url, ''), m.content, m.message_type, COALESCE(m.media_url, ''), m.created_at
 		FROM messages m
 		JOIN users u ON u.id = m.user_id
 		WHERE m.room_id = $1
@@ -940,7 +950,7 @@ func (s *Store) ListMessages(ctx context.Context, roomID uuid.UUID, limit int) (
 	messages := []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.RoomID, &m.UserID, &m.Username, &m.Content, &m.MessageType, &m.MediaURL, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.RoomID, &m.UserID, &m.Username, &m.AvatarURL, &m.Content, &m.MessageType, &m.MediaURL, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		messages = append(messages, m)
@@ -983,8 +993,8 @@ func (s *Store) VerifyUserByEmailAndTokenHash(ctx context.Context, email, tokenH
 		  AND email_verification_token_hash = $2
 		  AND email_verification_sent_at IS NOT NULL
 		  AND email_verification_sent_at >= NOW() - INTERVAL '24 hours'
-		RETURNING id, email, username, email_verified, password_hash, created_at
-	`, email, tokenHash).Scan(&u.ID, &u.Email, &u.Username, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
+		RETURNING id, email, username, COALESCE(avatar_url, ''), email_verified, password_hash, created_at
+	`, email, tokenHash).Scan(&u.ID, &u.Email, &u.Username, &u.AvatarURL, &u.EmailVerified, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
@@ -1215,10 +1225,19 @@ func (s *Store) AddFriendByInviteTokenHash(ctx context.Context, tokenHash string
 		return Friend{}, err
 	}
 	var f Friend
-	if err := s.DB.QueryRowContext(ctx, `SELECT id, username, email FROM users WHERE id = $1`, inviterID).Scan(&f.ID, &f.Username, &f.Email); err != nil {
+	if err := s.DB.QueryRowContext(ctx, `SELECT id, username, email, COALESCE(avatar_url, '') FROM users WHERE id = $1`, inviterID).Scan(&f.ID, &f.Username, &f.Email, &f.AvatarURL); err != nil {
 		return Friend{}, err
 	}
 	return f, nil
+}
+
+func (s *Store) UpdateUserAvatar(ctx context.Context, userID uuid.UUID, avatarURL string) error {
+	_, err := s.DB.ExecContext(ctx, `
+		UPDATE users
+		SET avatar_url = $2
+		WHERE id = $1
+	`, userID, nullableString(strings.TrimSpace(avatarURL)))
+	return err
 }
 
 func nullableString(v string) any {

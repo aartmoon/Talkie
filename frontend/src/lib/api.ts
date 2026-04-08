@@ -75,6 +75,11 @@ export const api = {
       body: JSON.stringify({ token, new_password: newPassword }),
     }),
   me: (token: string) => request<User>('/api/me', {}, token),
+  uploadMyAvatar: async (token: string, image: File) => {
+    const formData = new FormData();
+    formData.set('image', image);
+    return request<User>('/api/me/avatar', { method: 'POST', body: formData }, token);
+  },
   listRooms: (token: string) => request<Room[]>('/api/rooms', {}, token),
   createRoom: (token: string, name: string) =>
     request<Room>('/api/rooms', {

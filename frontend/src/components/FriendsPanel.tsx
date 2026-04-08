@@ -1,5 +1,6 @@
 import type { FormEvent } from 'react';
 import type { Friend, FriendsResponse } from '../lib/types';
+import { UserAvatar } from './UserAvatar';
 
 type FriendsPanelProps = {
   creatingFriendInvite: boolean;
@@ -8,12 +9,13 @@ type FriendsPanelProps = {
   sentFriendRequests: Record<string, boolean>;
   userSearchQuery: string;
   userSearchResults: Friend[];
+  resolveAvatarUrl: (avatar?: string) => string;
   onAddFriend: (userID: string) => void;
   onAcceptFriend: (requestID: number) => void;
   onDeclineFriend: (requestID: number) => void;
   onGenerateFriendInviteLink: () => void;
   onOpenDMWith: (userID: string) => void;
-  onOpenProfile: (userID: string, username: string) => void;
+  onOpenProfile: (userID: string, username: string, avatarUrl?: string) => void;
   onSearchChange: (nextQuery: string) => void;
   onSearchSubmit: (e: FormEvent) => void;
 };
@@ -25,6 +27,7 @@ export function FriendsPanel({
   sentFriendRequests,
   userSearchQuery,
   userSearchResults,
+  resolveAvatarUrl,
   onAddFriend,
   onAcceptFriend,
   onDeclineFriend,
@@ -54,6 +57,7 @@ export function FriendsPanel({
       <ul className="room-list">
         {userSearchResults.map((f) => (
           <li key={f.id}>
+            <UserAvatar username={f.username} avatarUrl={resolveAvatarUrl(f.avatar_url)} size="sm" />
             <button
               onClick={() => onAddFriend(f.id)}
               type="button"
@@ -73,10 +77,11 @@ export function FriendsPanel({
         <ul className="participant-list">
           {friendsData.incoming.map((fr) => (
             <li key={fr.id}>
+              <UserAvatar username={fr.requester_username} avatarUrl={resolveAvatarUrl(fr.requester_avatar_url)} size="sm" />
               <button
                 type="button"
                 className="msg-user-btn participant-name"
-                onClick={() => onOpenProfile(fr.requester_id, fr.requester_username)}
+                onClick={() => onOpenProfile(fr.requester_id, fr.requester_username, fr.requester_avatar_url)}
               >
                 {fr.requester_username}
               </button>
@@ -91,10 +96,11 @@ export function FriendsPanel({
         <ul className="participant-list">
           {friendsData.friends.map((f) => (
             <li key={f.id}>
+              <UserAvatar username={f.username} avatarUrl={resolveAvatarUrl(f.avatar_url)} size="sm" />
               <button
                 type="button"
                 className="msg-user-btn participant-name"
-                onClick={() => onOpenProfile(f.id, f.username)}
+                onClick={() => onOpenProfile(f.id, f.username, f.avatar_url)}
               >
                 {f.username}
               </button>

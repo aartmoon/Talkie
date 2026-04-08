@@ -108,6 +108,75 @@ func (s *Server) uploadRoomImage(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusCreated, msg)
 }
 
+func (s *Server) uploadMyAvatar(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxImageUploadSize)
+	if err := r.ParseMultipartForm(maxImageUploadSize); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid upload payload or file too large")
+		return
+	}
+
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "missing image file")
+		return
+	}
+	defer file.Close()
+
+	head := make([]byte, 512)
+	n, err := io.ReadFull(file, head)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		jsonError(w, http.StatusBadRequest, "failed to read image")
+		return
+	}
+	head = head[:n]
+	contentType := http.DetectContentType(head)
+	ext, valid := imageExt(contentType)
+	if !valid {
+		jsonError(w, http.StatusBadRequest, "only png, jpeg, webp or gif images are allowed")
+		return
+	}
+
+	avatarDir := filepath.Join(s.Cfg.UploadsDir, "avatars", user.ID.String())
+	if err := os.MkdirAll(avatarDir, 0o755); err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to prepare uploads directory")
+		return
+	}
+
+	filename := fmt.Sprintf("%s%s", uuid.NewString(), ext)
+	targetPath := filepath.Join(avatarDir, filename)
+	target, err := os.Create(targetPath)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to store image")
+		return
+	}
+	defer target.Close()
+
+	if _, err := io.Copy(target, io.MultiReader(bytes.NewReader(head), file)); err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to store image")
+		return
+	}
+
+	relativeURL := fmt.Sprintf("/uploads/avatars/%s/%s", user.ID.String(), filename)
+	if err := s.Store.UpdateUserAvatar(r.Context(), user.ID, relativeURL); err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to save avatar")
+		return
+	}
+
+	updatedUser, err := s.Store.FindUserByID(r.Context(), user.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to load user")
+		return
+	}
+	updatedUser.PasswordHash = ""
+	jsonResponse(w, http.StatusOK, updatedUser)
+}
+
 func imageExt(contentType string) (string, bool) {
 	switch contentType {
 	case "image/png":

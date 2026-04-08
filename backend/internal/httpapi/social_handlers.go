@@ -66,6 +66,7 @@ func (s *Server) userProfile(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"id":         u.ID,
 		"username":   u.Username,
+		"avatar_url": u.AvatarURL,
 		"created_at": u.CreatedAt,
 		"is_friend":  isFriend,
 	})
@@ -247,6 +248,7 @@ func (s *Server) createOrGetDMRoom(w http.ResponseWriter, r *http.Request) {
 	targetUser, err := s.Store.FindUserByID(r.Context(), targetID)
 	if err == nil {
 		room.Name = targetUser.Username
+		room.AvatarURL = targetUser.AvatarURL
 	}
 	jsonResponse(w, http.StatusOK, room)
 }

@@ -23,6 +23,7 @@ type MessagePayload struct {
 	RoomID      string    `json:"room_id"`
 	UserID      string    `json:"user_id"`
 	Username    string    `json:"username"`
+	AvatarURL   string    `json:"avatar_url,omitempty"`
 	Content     string    `json:"content"`
 	MessageType string    `json:"message_type"`
 	MediaURL    string    `json:"media_url,omitempty"`
@@ -30,8 +31,9 @@ type MessagePayload struct {
 }
 
 type Participant struct {
-	ID       string `json:"id"`
-	Username string `json:"username"`
+	ID        string `json:"id"`
+	Username  string `json:"username"`
+	AvatarURL string `json:"avatar_url,omitempty"`
 }
 
 func PayloadFromMessage(m db.Message) MessagePayload {
@@ -40,6 +42,7 @@ func PayloadFromMessage(m db.Message) MessagePayload {
 		RoomID:      m.RoomID.String(),
 		UserID:      m.UserID.String(),
 		Username:    m.Username,
+		AvatarURL:   m.AvatarURL,
 		Content:     m.Content,
 		MessageType: m.MessageType,
 		MediaURL:    m.MediaURL,

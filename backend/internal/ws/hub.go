@@ -102,7 +102,7 @@ func (h *Hub) Participants(roomID uuid.UUID) []Participant {
 	clients := h.rooms[roomID]
 	participants := make([]Participant, 0, len(clients))
 	for c := range clients {
-		participants = append(participants, Participant{ID: c.UserID.String(), Username: c.Username})
+		participants = append(participants, Participant{ID: c.UserID.String(), Username: c.Username, AvatarURL: c.AvatarURL})
 	}
 	return participants
 }
@@ -111,7 +111,7 @@ func (h *Hub) SetInCall(c *Client, inCall bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if inCall {
-		h.addCallLocked(c.RoomID, c.UserID, c.Username)
+		h.addCallLocked(c.RoomID, c.UserID, c.Username, c.AvatarURL)
 		return
 	}
 	h.removeCallLocked(c.RoomID, c.UserID)
@@ -128,7 +128,7 @@ func (h *Hub) CallParticipants(roomID uuid.UUID) []Participant {
 	return out
 }
 
-func (h *Hub) addCallLocked(roomID, userID uuid.UUID, username string) {
+func (h *Hub) addCallLocked(roomID, userID uuid.UUID, username, avatarURL string) {
 	if _, ok := h.callCounts[roomID]; !ok {
 		h.callCounts[roomID] = make(map[uuid.UUID]int)
 	}
@@ -136,7 +136,7 @@ func (h *Hub) addCallLocked(roomID, userID uuid.UUID, username string) {
 		h.callUsers[roomID] = make(map[uuid.UUID]Participant)
 	}
 	h.callCounts[roomID][userID]++
-	h.callUsers[roomID][userID] = Participant{ID: userID.String(), Username: username}
+	h.callUsers[roomID][userID] = Participant{ID: userID.String(), Username: username, AvatarURL: avatarURL}
 }
 
 func (h *Hub) removeCallLocked(roomID, userID uuid.UUID) {

@@ -2,6 +2,7 @@ export type User = {
   id: string;
   email: string;
   username: string;
+  avatar_url?: string;
   email_verified?: boolean;
   created_at: string;
 };
@@ -16,6 +17,7 @@ export type Room = {
   position?: number;
   my_role?: 'admin' | 'member';
   can_manage?: boolean;
+  avatar_url?: string;
   created_at: string;
 };
 
@@ -24,6 +26,7 @@ export type Message = {
   room_id: string;
   user_id: string;
   username: string;
+  avatar_url?: string;
   content: string;
   message_type: 'text' | 'image';
   media_url?: string;
@@ -33,12 +36,14 @@ export type Message = {
 export type Participant = {
   id: string;
   username: string;
+  avatar_url?: string;
 };
 
 export type Friend = {
   id: string;
   username: string;
   email: string;
+  avatar_url?: string;
 };
 
 export type FriendRequest = {
@@ -46,7 +51,9 @@ export type FriendRequest = {
   requester_id: string;
   addressee_id: string;
   requester_username: string;
+  requester_avatar_url?: string;
   addressee_username: string;
+  addressee_avatar_url?: string;
   status: 'pending' | 'accepted' | 'rejected';
   created_at: string;
 };
@@ -59,6 +66,7 @@ export type FriendsResponse = {
 export type UserProfile = {
   id: string;
   username: string;
+  avatar_url?: string;
   created_at: string;
   is_friend: boolean;
 };

@@ -24,6 +24,7 @@ type Client struct {
 	RoomID   uuid.UUID
 	UserID   uuid.UUID
 	Username string
+	AvatarURL string
 	InCall   bool
 	Send     chan OutgoingMessage
 }
@@ -39,7 +40,7 @@ func (c *Client) ReadPump() {
 		if err == nil {
 			participants := make([]Participant, 0, len(members))
 			for _, m := range members {
-				participants = append(participants, Participant{ID: m.ID.String(), Username: m.Username})
+				participants = append(participants, Participant{ID: m.ID.String(), Username: m.Username, AvatarURL: m.AvatarURL})
 			}
 			c.Hub.Broadcast(c.RoomID, OutgoingMessage{Type: "participants", Participants: participants})
 		}

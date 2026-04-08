@@ -52,6 +52,7 @@ func (s *Server) Routes() http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Auth(s.Cfg.JWTSecret))
 			r.Get("/me", s.me)
+			r.Post("/me/avatar", s.uploadMyAvatar)
 			r.Get("/rooms", s.listRooms)
 			r.Post("/rooms", s.createRoom)
 			r.Post("/rooms/{roomID}/join", s.joinRoom)

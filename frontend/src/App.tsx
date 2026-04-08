@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import { APIError, api } from './lib/api';
 import type { Friend, FriendsResponse, Message, Participant, Room as AppRoom, RoomGroup, User } from './lib/types';
 import { FriendsPanel } from './components/FriendsPanel';
+import { UserAvatar } from './components/UserAvatar';
 
 type AuthView = 'login' | 'register' | 'verify' | 'forgot' | 'reset';
 type CreateMode = 'server' | 'room';
-type MiniProfile = { id: string; username: string; createdAt?: string; isFriend?: boolean; loading: boolean };
+type MiniProfile = { id: string; username: string; avatarURL?: string; createdAt?: string; isFriend?: boolean; loading: boolean };
 type SidebarView = { kind: 'root' } | { kind: 'group'; groupID: string };
 
 function flattenGroupChannels(groups: RoomGroup[]): AppRoom[] {
@@ -66,6 +67,7 @@ type VideoTrackItem = {
 type CallParticipant = {
   id: string;
   username: string;
+  avatarURL?: string;
   micEnabled: boolean | null;
   hasCamera: boolean;
   hasScreen: boolean;
@@ -87,6 +89,10 @@ function mediaUrl(apiBase: string, mediaPath?: string): string {
   if (!mediaPath) return '';
   if (mediaPath.startsWith('http://') || mediaPath.startsWith('https://')) return mediaPath;
   return `${apiBase}${mediaPath}`;
+}
+
+function avatarUrl(apiBase: string, avatarPath?: string): string {
+  return mediaUrl(apiBase, avatarPath);
 }
 
 function looksLikeImageFilename(value: string): boolean {
@@ -166,9 +172,6 @@ export function App() {
   const [groups, setGroups] = useState<RoomGroup[]>([]);
   const [dmRooms, setDMRooms] = useState<AppRoom[]>([]);
   const [sidebarView, setSidebarView] = useState<SidebarView>({ kind: 'root' });
-  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
-    () => localStorage.getItem('talkie_sidebar_collapsed') === '1',
-  );
   const [friendsData, setFriendsData] = useState<FriendsResponse>({ friends: [], incoming: [] });
   const [userSearchQuery, setUserSearchQuery] = useState('');
   const [userSearchResults, setUserSearchResults] = useState<Friend[]>([]);
@@ -203,6 +206,7 @@ export function App() {
   const [newPasswordConfirmInput, setNewPasswordConfirmInput] = useState('');
   const [creatingFriendInvite, setCreatingFriendInvite] = useState(false);
   const [copyNotice, setCopyNotice] = useState<string | null>(null);
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
   const [roomActivityByID, setRoomActivityByID] = useState<Record<string, number>>({});
   const [activeCallsByRoom, setActiveCallsByRoom] = useState<Record<string, number>>({});
@@ -237,6 +241,7 @@ export function App() {
   const eventsWsRef = useRef<WebSocket | null>(null);
   const roomWsReconnectRef = useRef<number | null>(null);
   const roomRef = useRef<Room | null>(null);
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const roomsRef = useRef<AppRoom[]>([]);
   const dmRoomsRef = useRef<AppRoom[]>([]);
   const callRoomIDRef = useRef<string | null>(null);
@@ -262,14 +267,13 @@ export function App() {
       ),
     [dmRooms, roomActivityByID],
   );
-  const hasUnreadChats = useMemo(
-    () => [...rooms, ...dmRooms].some((room) => (unreadByRoom[room.id] || 0) > 0),
-    [rooms, dmRooms, unreadByRoom],
+  const hasUnreadGroupChats = useMemo(
+    () => rooms.some((room) => (unreadByRoom[room.id] || 0) > 0),
+    [rooms, unreadByRoom],
   );
-  const groupedRoomIDs = useMemo(() => new Set(flattenGroupChannels(groups).map((room) => room.id)), [groups]);
-  const standaloneRooms = useMemo(
-    () => rooms.filter((room) => !groupedRoomIDs.has(room.id)),
-    [rooms, groupedRoomIDs],
+  const hasUnreadDMs = useMemo(
+    () => dmRooms.some((room) => (unreadByRoom[room.id] || 0) > 0),
+    [dmRooms, unreadByRoom],
   );
   const friendIDs = useMemo(() => new Set(friendsData.friends.map((f) => f.id)), [friendsData.friends]);
   const focusedTile = useMemo(
@@ -284,10 +288,6 @@ export function App() {
     if (!activeCallRoomID) return null;
     return [...rooms, ...dmRooms].find((room) => room.id === activeCallRoomID) || null;
   }, [activeCallRoomID, rooms, dmRooms]);
-  const activeCallRoomKind = useMemo(() => {
-    if (!activeCallRoom) return null;
-    return dmRooms.some((room) => room.id === activeCallRoom.id) ? 'dm' : 'room';
-  }, [activeCallRoom, dmRooms]);
   const selectedRoomIsDM = useMemo(
     () => Boolean(selectedRoom && dmRooms.some((room) => room.id === selectedRoom.id)),
     [selectedRoom, dmRooms],
@@ -299,19 +299,13 @@ export function App() {
   const selectedRoomIsVoiceOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'voice');
   const canUseCallUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsVoiceOnly || !selectedRoomChannelType));
   const canUseChatUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsTextOnly || !selectedRoomChannelType));
-  const sortedStandaloneRooms = useMemo(
-    () =>
-      [...standaloneRooms].sort(
-        (a, b) => (roomActivityByID[b.id] || new Date(b.created_at).getTime()) - (roomActivityByID[a.id] || new Date(a.created_at).getTime()),
-      ),
-    [standaloneRooms, roomActivityByID],
-  );
   const selectedSidebarGroup = useMemo(
     () => (sidebarView.kind === 'group' ? groups.find((group) => group.id === sidebarView.groupID) || null : null),
     [sidebarView, groups],
   );
   const showRightInviteLinkButton = Boolean(!selectedRoomIsDM && !selectedSidebarGroup && !selectedRoomInGroup);
   const showRightInvitePanel = Boolean(!selectedRoomIsDM && !selectedSidebarGroup && !selectedRoomInGroup);
+  const resolveAvatarUrl = (path?: string) => avatarUrl(api.apiBase, path);
 
   function videoKey(participantID: string, source: Track.Source, sid?: string): string {
     return sid || `${participantID}-${source}`;
@@ -402,7 +396,15 @@ export function App() {
       } catch (err) {
         localStorage.removeItem('talkie_token');
         setToken(null);
-        setError(err instanceof Error ? err.message : 'authentication failed');
+        setUser(null);
+        const message = err instanceof Error ? err.message : 'authentication failed';
+        const isTokenError = /invalid token|unauthorized|authentication failed/i.test(message);
+        if (isTokenError) {
+          setError(null);
+          setAuthMessage('Сессия истекла. Войдите снова.');
+        } else {
+          setError(message);
+        }
       }
     })();
   }, [token]);
@@ -724,8 +726,10 @@ export function App() {
   }, [token]);
 
   useEffect(() => {
-    localStorage.setItem('talkie_sidebar_collapsed', sidebarCollapsed ? '1' : '0');
-  }, [sidebarCollapsed]);
+    if (selectedRoomIsDM && sidebarView.kind !== 'root') {
+      setSidebarView({ kind: 'root' });
+    }
+  }, [selectedRoomIsDM, sidebarView.kind]);
 
   useEffect(() => {
     localStorage.setItem('talkie_join_with_mic', joinWithMicEnabled ? '1' : '0');
@@ -1126,6 +1130,7 @@ export function App() {
       {
         id: room.localParticipant.identity,
         username: user?.username || room.localParticipant.identity,
+        avatarURL: user?.avatar_url,
         micEnabled: room.localParticipant.isMicrophoneEnabled,
         hasCamera: false,
         hasScreen: false,
@@ -1143,6 +1148,7 @@ export function App() {
         return {
           id: p.identity,
           username: p.name || p.identity,
+          avatarURL: callParticipants.find((x) => x.id === p.identity)?.avatarURL,
           micEnabled: !p.isMicrophoneEnabled ? false : !p.getTrackPublication(Track.Source.Microphone)?.isMuted,
           hasCamera,
           hasScreen,
@@ -1159,6 +1165,7 @@ export function App() {
       users.map((u) => ({
         id: u.id,
         username: u.username,
+        avatarURL: u.avatar_url,
         micEnabled: null,
         hasCamera: false,
         hasScreen: false,
@@ -1852,8 +1859,8 @@ export function App() {
     }
   }
 
-  function openMiniProfile(id: string, username: string) {
-    setMiniProfile({ id, username, loading: true });
+  function openMiniProfile(id: string, username: string, avatarURL?: string) {
+    setMiniProfile({ id, username, avatarURL, loading: true });
     if (!token) return;
     void api.userProfile(token, id)
       .then((profile) => {
@@ -1862,6 +1869,7 @@ export function App() {
           return {
             id: profile.id,
             username: profile.username,
+            avatarURL: profile.avatar_url,
             createdAt: profile.created_at,
             isFriend: profile.is_friend,
             loading: false,
@@ -1871,6 +1879,24 @@ export function App() {
       .catch(() => {
         setMiniProfile((prev) => (prev && prev.id === id ? { ...prev, loading: false } : prev));
       });
+  }
+
+  async function handleMyAvatarUpload(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file || !token) return;
+    setUploadingAvatar(true);
+    setError(null);
+    try {
+      const updated = await api.uploadMyAvatar(token, file);
+      setUser(updated);
+      await refreshSocial();
+      setCopyNotice('Аватар обновлен');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'failed to upload avatar');
+    } finally {
+      e.target.value = '';
+      setUploadingAvatar(false);
+    }
   }
 
   async function acceptFriend(requestID: number) {
@@ -2060,15 +2086,13 @@ export function App() {
   }
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${!sidebarCollapsed && selectedSidebarGroup ? 'sidebar-with-flyout' : ''}`}>
-      <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
+    <div className="app-shell">
+      <aside className="sidebar">
         <header className="brand brand-row">
-          {!sidebarCollapsed && (
-            <div>
-              <h2>Talkie</h2>
-              <small>Серверы и каналы</small>
-            </div>
-          )}
+          <div>
+            <h2>Talkie</h2>
+            <small>Серверы и каналы</small>
+          </div>
           <div className="sidebar-header-actions">
             <button
               type="button"
@@ -2082,50 +2106,21 @@ export function App() {
             >
               +
             </button>
-            <button
-              className="sidebar-toggle"
-              type="button"
-              onClick={() => setSidebarCollapsed((prev) => !prev)}
-              title={sidebarCollapsed ? 'Развернуть боковую панель' : 'Свернуть боковую панель'}
-            >
-              {sidebarCollapsed ? '>>' : '<<'}
-            </button>
           </div>
         </header>
 
-        {!sidebarCollapsed ? (
-          <>
-            <div className="sidebar-main">
-              <div className={`sidebar-main-layout ${selectedSidebarGroup ? 'with-flyout' : ''}`}>
-                <div className="rooms-panel sidebar-pane">
-                  <div className="sidebar-title-row">
-                    <strong>Чаты</strong>
-                    {hasUnreadChats && <span className="red-dot" />}
-                  </div>
-                  <ul className="room-list">
-                    {inCall && activeCallRoom && (
-                      <li key={`active-call-${activeCallRoom.id}`}>
-                        <button
-                          type="button"
-                          className={`current-call-card ${selectedRoom?.id === activeCallRoom.id ? 'active' : ''}`}
-                          onClick={() => {
-                            setSidebarView({ kind: 'root' });
-                            openRoom(activeCallRoom);
-                          }}
-                          title="Перейти в беседу звонка"
-                        >
-                          <span className="chat-kind kind-call">ЗВОНОК</span>
-                          <span className="room-main">
-                            <span className="room-name">{`${activeCallRoomKind === 'dm' ? '@' : '#'} ${activeCallRoom.name}`}</span>
-                            <span className="room-preview">
-                              {(activeCallsByRoom[activeCallRoom.id] || 0) > 0
-                                ? `Сейчас в звонке • ${activeCallsByRoom[activeCallRoom.id]} участ.`
-                                : 'Сейчас в звонке'}
-                            </span>
-                          </span>
-                        </button>
-                      </li>
-                    )}
+        <div className="sidebar-main">
+              <div className="sidebar-main-layout with-flyout">
+                <div className="sidebar-pane server-rail-pane">
+                  <button
+                    type="button"
+                    className={`server-rail-home ${sidebarView.kind === 'root' ? 'active' : ''}`}
+                    onClick={() => setSidebarView({ kind: 'root' })}
+                  >
+                    ЛС
+                    {(hasUnreadDMs || hasUnreadGroupChats) && <span className="red-dot" />}
+                  </button>
+                  <ul className="server-rail-list">
                     {groups.map((group) => {
                       const groupRooms = [...group.text_channels, ...group.voice_channels];
                       const hasUnread = groupRooms.some((room) => (unreadByRoom[room.id] || 0) > 0);
@@ -2133,116 +2128,145 @@ export function App() {
                         <li key={group.id}>
                           <button
                             type="button"
-                            className={sidebarView.kind === 'group' && sidebarView.groupID === group.id ? 'active' : ''}
+                            className={`server-rail-btn ${sidebarView.kind === 'group' && sidebarView.groupID === group.id ? 'active' : ''}`}
                             onClick={() => openSidebarGroup(group)}
+                            title={group.name}
                           >
-                            <span className="chat-kind kind-channel">КАНАЛ</span>
-                            <span className="room-name">{group.name}</span>
+                            <UserAvatar username={group.name} size="sm" />
                             {hasUnread && <span className="red-dot" />}
                           </button>
                         </li>
                       );
                     })}
-                    {sortedStandaloneRooms.map((room) => (
-                      <li key={room.id}>
-                        <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
-                          <span className="chat-kind kind-group">ГРУППА</span>
-                          <span className="room-main">
-                            <span className="room-name">{room.name}</span>
-                            <span className="room-preview">{lastMessagePreviewByRoom[room.id] || ''}</span>
-                          </span>
-                          {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
-                        </button>
-                      </li>
-                    ))}
-                    {sortedDMRooms.map((room) => (
-                      <li key={room.id}>
-                        <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
-                          <span className="chat-kind kind-dm">ЛС</span>
-                          <span className="room-main">
-                            <span className="room-name">{room.name}</span>
-                            <span className="room-preview">{lastMessagePreviewByRoom[room.id] || ''}</span>
-                          </span>
-                          {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
-                        </button>
-                      </li>
-                    ))}
                   </ul>
                 </div>
-                {selectedSidebarGroup && (
-                  <div className="sidebar-pane secondary-pane">
-                    <div className="group-head">
-                      <strong>{selectedSidebarGroup.name}</strong>
-                      {selectedSidebarGroup.can_manage && (
-                        <div className="group-actions">
-                          <button type="button" className="ghost" onClick={() => renameGroupPrompt(selectedSidebarGroup.id, selectedSidebarGroup.name)}>
-                            Переименовать
-                          </button>
-                          <button type="button" className="ghost" onClick={() => createChannelInGroup(selectedSidebarGroup.id, 'text')}>
-                            +Текст
-                          </button>
-                          <button type="button" className="ghost" onClick={() => createChannelInGroup(selectedSidebarGroup.id, 'voice')}>
-                            +Голос
-                          </button>
-                        </div>
+                <div className="sidebar-pane secondary-pane">
+                  {sidebarView.kind === 'root' ? (
+                    <>
+                      <div className="group-head">
+                        <strong>Личные сообщения</strong>
+                      </div>
+                      {inCall && activeCallRoom && (
+                        <ul className="room-list">
+                          <li key={`active-call-${activeCallRoom.id}`}>
+                            <button
+                              type="button"
+                              className={`current-call-card ${selectedRoom?.id === activeCallRoom.id ? 'active' : ''}`}
+                              onClick={() => {
+                                setSidebarView({ kind: 'root' });
+                                openRoom(activeCallRoom);
+                              }}
+                              title="Перейти в беседу звонка"
+                            >
+                              <UserAvatar username={activeCallRoom.name} avatarUrl={resolveAvatarUrl(activeCallRoom.avatar_url)} size="sm" />
+                              <span className="room-main">
+                                <span className="room-name">{activeCallRoom.name}</span>
+                                <span className="room-preview">
+                                  {(activeCallsByRoom[activeCallRoom.id] || 0) > 0
+                                    ? `Сейчас в звонке • ${activeCallsByRoom[activeCallRoom.id]} участ.`
+                                    : 'Сейчас в звонке'}
+                                </span>
+                              </span>
+                            </button>
+                          </li>
+                        </ul>
                       )}
-                    </div>
-                    <div className="flyout-tools">
-                      <button
-                        type="button"
-                        className="secondary-action"
-                        onClick={() => generateGroupInviteLink(selectedSidebarGroup)}
-                        disabled={generatingInviteLink}
-                      >
-                        {generatingInviteLink ? 'Создаем...' : 'Ссылка-приглашение в канал'}
-                      </button>
-                      {copyNotice && <small className="copy-notice">{copyNotice}</small>}
-                    </div>
-                    <small className="group-subtitle">Текстовые каналы</small>
-                    <ul className="room-list">
-                      {selectedSidebarGroup.text_channels
-                        .slice()
-                        .sort((a, b) => a.position - b.position)
-                        .map((room) => (
+                      <small className="group-subtitle">Личные сообщения</small>
+                      <ul className="room-list">
+                        {sortedDMRooms.map((room) => (
                           <li key={room.id}>
-                            <button
-                              className={selectedRoom?.id === room.id ? 'active' : ''}
-                              onClick={() => openRoom(toAppRoomFromGroupChannel(room, selectedSidebarGroup.id))}
-                            >
-                              <span className="chat-kind kind-channel">КАНАЛ</span>
-                              <span className="room-name">{room.name}</span>
+                            <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
+                              <UserAvatar username={room.name} avatarUrl={resolveAvatarUrl(room.avatar_url)} size="sm" />
+                              <span className="room-main">
+                                <span className="room-name">{room.name}</span>
+                                <span className="room-preview">{lastMessagePreviewByRoom[room.id] || ''}</span>
+                              </span>
                               {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
                             </button>
                           </li>
                         ))}
-                    </ul>
-                    <small className="group-subtitle">Голосовые каналы</small>
-                    <ul className="room-list">
-                      {selectedSidebarGroup.voice_channels
-                        .slice()
-                        .sort((a, b) => a.position - b.position)
-                        .map((room) => (
-                          <li key={room.id}>
-                            <button
-                              className={selectedRoom?.id === room.id ? 'active' : ''}
-                              onClick={() => openRoom(toAppRoomFromGroupChannel(room, selectedSidebarGroup.id))}
-                            >
-                              <span className="chat-kind kind-channel">КАНАЛ</span>
-                              <span className="room-name">{room.name}</span>
-                              {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                      </ul>
+                    </>
+                  ) : (
+                    <>
+                      <div className="group-head">
+                        <strong>{selectedSidebarGroup?.name || 'Каналы'}</strong>
+                        {selectedSidebarGroup && selectedSidebarGroup.can_manage && (
+                          <div className="group-actions">
+                            <button type="button" className="ghost" onClick={() => renameGroupPrompt(selectedSidebarGroup.id, selectedSidebarGroup.name)}>
+                              Переименовать
                             </button>
-                          </li>
-                        ))}
-                    </ul>
-                  </div>
-                )}
+                            <button type="button" className="ghost" onClick={() => createChannelInGroup(selectedSidebarGroup.id, 'text')}>
+                              +Текст
+                            </button>
+                            <button type="button" className="ghost" onClick={() => createChannelInGroup(selectedSidebarGroup.id, 'voice')}>
+                              +Голос
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                      {selectedSidebarGroup && (
+                        <>
+                          <div className="flyout-tools">
+                            <button
+                              type="button"
+                              className="secondary-action"
+                              onClick={() => generateGroupInviteLink(selectedSidebarGroup)}
+                              disabled={generatingInviteLink}
+                            >
+                              {generatingInviteLink ? 'Создаем...' : 'Ссылка-приглашение в канал'}
+                            </button>
+                            {copyNotice && <small className="copy-notice">{copyNotice}</small>}
+                          </div>
+                          <small className="group-subtitle">Текстовые каналы</small>
+                          <ul className="room-list">
+                            {selectedSidebarGroup.text_channels
+                              .slice()
+                              .sort((a, b) => a.position - b.position)
+                              .map((room) => (
+                                <li key={room.id}>
+                                  <button
+                                    className={selectedRoom?.id === room.id ? 'active' : ''}
+                                    onClick={() => openRoom(toAppRoomFromGroupChannel(room, selectedSidebarGroup.id))}
+                                  >
+                                    <span className="room-name">{room.name}</span>
+                                    {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                                  </button>
+                                </li>
+                              ))}
+                          </ul>
+                          <small className="group-subtitle">Голосовые каналы</small>
+                          <ul className="room-list">
+                            {selectedSidebarGroup.voice_channels
+                              .slice()
+                              .sort((a, b) => a.position - b.position)
+                              .map((room) => (
+                                <li key={room.id}>
+                                  <button
+                                    className={selectedRoom?.id === room.id ? 'active' : ''}
+                                    onClick={() => openRoom(toAppRoomFromGroupChannel(room, selectedSidebarGroup.id))}
+                                  >
+                                    <span className="room-name">{room.name}</span>
+                                    {(unreadByRoom[room.id] || 0) > 0 && <span className="room-unread">{unreadByRoom[room.id]}</span>}
+                                  </button>
+                                </li>
+                              ))}
+                          </ul>
+                        </>
+                      )}
+                    </>
+                  )}
+                </div>
               </div>
-            </div>
+        </div>
 
-            <div className="sidebar-user">
-              <div>
-                <strong>{user.username}</strong>
-                <small>{user.email}</small>
+        <div className="sidebar-user">
+              <div className="sidebar-user-head">
+                <UserAvatar username={user.username} avatarUrl={resolveAvatarUrl(user.avatar_url)} size="md" />
+                <div>
+                  <strong>{user.username}</strong>
+                  <small>{user.email}</small>
+                </div>
               </div>
               <div className="sidebar-user-actions">
                 <button type="button" className="ghost sidebar-user-btn" onClick={() => setShowFriendsModal(true)}>
@@ -2250,11 +2274,24 @@ export function App() {
                 </button>
                 <button className="logout sidebar-user-btn" onClick={logout}>Выйти</button>
               </div>
-            </div>
-          </>
-        ) : (
-          <div className="sidebar-rail" />
-        )}
+              <div className="sidebar-user-actions single">
+                <input
+                  ref={avatarInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif"
+                  className="hidden-file-input"
+                  onChange={handleMyAvatarUpload}
+                />
+                <button
+                  type="button"
+                  className="ghost sidebar-user-btn"
+                  disabled={uploadingAvatar}
+                  onClick={() => avatarInputRef.current?.click()}
+                >
+                  {uploadingAvatar ? 'Загрузка аватара...' : 'Сменить аватар'}
+                </button>
+              </div>
+        </div>
       </aside>
 
       <main className="content">
@@ -2265,10 +2302,10 @@ export function App() {
             <section className="media-panel">
               <div className="media-header">
                 <div className="media-title">
-                  <h3>{selectedRoom.name}</h3>
-                  <small>
-                    {inCall ? 'Подключено к голосовому каналу' : 'Канал'}
-                  </small>
+                  <h3 className="media-title-main">
+                    <UserAvatar username={selectedRoom.name} avatarUrl={resolveAvatarUrl(selectedRoom.avatar_url)} size="md" />
+                    {selectedRoom.name}
+                  </h3>
                 </div>
                 <div className="room-header-actions">
                   <button
@@ -2308,11 +2345,11 @@ export function App() {
                     <ul className="call-roster-list">
                       {callParticipants.map((p) => (
                         <li key={p.id} className={activeSpeakerIDs.includes(p.id) ? 'is-speaking' : ''}>
-                          <span className="avatar-dot" />
+                          <UserAvatar username={p.username} avatarUrl={resolveAvatarUrl(p.avatarURL)} size="sm" />
                           <button
                             type="button"
                             className="msg-user-btn participant-name"
-                            onClick={() => openMiniProfile(p.id, p.username)}
+                            onClick={() => openMiniProfile(p.id, p.username, p.avatarURL)}
                           >
                             {p.username}
                           </button>
@@ -2463,14 +2500,17 @@ export function App() {
                   <div className="messages" ref={messagesRef}>
                     {messages.map((m) => (
                       <p key={m.id} className={m.message_type === 'image' ? 'image-message' : ''}>
-                        <button
-                          type="button"
-                          className="msg-user-btn msg-user-top"
-                          onClick={() => openMiniProfile(m.user_id, m.username)}
-                          title={m.user_id === user.id ? 'Вы' : 'Профиль'}
-                        >
-                          {m.username}
-                        </button>
+                        <span className="msg-header">
+                          <UserAvatar username={m.username} avatarUrl={resolveAvatarUrl(m.avatar_url)} size="sm" />
+                          <button
+                            type="button"
+                            className="msg-user-btn msg-user-top"
+                            onClick={() => openMiniProfile(m.user_id, m.username, m.avatar_url)}
+                            title={m.user_id === user.id ? 'Вы' : 'Профиль'}
+                          >
+                            {m.username}
+                          </button>
+                        </span>
                         {!(m.message_type === 'image' && looksLikeImageFilename(m.content)) && (
                           <span className="msg-content">{m.content}</span>
                         )}
@@ -2536,6 +2576,7 @@ export function App() {
                       <ul className="participant-list">
                         {inviteResults.map((candidate) => (
                           <li key={candidate.id}>
+                            <UserAvatar username={candidate.username} avatarUrl={resolveAvatarUrl(candidate.avatar_url)} size="sm" />
                             <span className="participant-name">{candidate.username}</span>
                             <button type="button" onClick={() => inviteUserToRoom(candidate.id)}>
                               Пригласить
@@ -2554,8 +2595,8 @@ export function App() {
                     <ul className="participant-list">
                       {chatParticipants.map((p) => (
                         <li key={p.id}>
-                          <span className="avatar-dot" />
-                          <button type="button" className="msg-user-btn" onClick={() => openMiniProfile(p.id, p.username)}>
+                          <UserAvatar username={p.username} avatarUrl={resolveAvatarUrl(p.avatar_url)} size="sm" />
+                          <button type="button" className="msg-user-btn" onClick={() => openMiniProfile(p.id, p.username, p.avatar_url)}>
                             {p.username}
                           </button>
                         </li>
@@ -2580,12 +2621,13 @@ export function App() {
                 sentFriendRequests={sentFriendRequests}
                 userSearchQuery={userSearchQuery}
                 userSearchResults={userSearchResults}
+                resolveAvatarUrl={resolveAvatarUrl}
                 onAddFriend={(userID) => addFriend(userID)}
                 onAcceptFriend={(requestID) => acceptFriend(requestID)}
                 onDeclineFriend={(requestID) => declineFriend(requestID)}
                 onGenerateFriendInviteLink={() => generateFriendInviteLink()}
                 onOpenDMWith={(userID) => openDMWith(userID)}
-                onOpenProfile={(userID, uname) => openMiniProfile(userID, uname)}
+                onOpenProfile={(userID, uname, avatar) => openMiniProfile(userID, uname, avatar)}
                 onSearchChange={(nextQuery) => setUserSearchQuery(nextQuery)}
                 onSearchSubmit={handleUserSearch}
               />
@@ -2596,7 +2638,10 @@ export function App() {
         {miniProfile && (
           <div className="mini-profile-overlay" onClick={() => setMiniProfile(null)} role="button" tabIndex={0}>
             <div className="mini-profile-card" onClick={(e) => e.stopPropagation()}>
-              <h4>{miniProfile.username}</h4>
+              <div className="mini-profile-head">
+                <UserAvatar username={miniProfile.username} avatarUrl={resolveAvatarUrl(miniProfile.avatarURL)} size="lg" />
+                <h4>{miniProfile.username}</h4>
+              </div>
               {miniProfile.loading ? (
                 <small>Загрузка профиля...</small>
               ) : (

@@ -62,15 +62,21 @@ func (s *Server) roomWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	u, err := s.Store.FindUserByID(r.Context(), userID)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
 
 	c := &ws.Client{
-		Conn:     conn,
-		Hub:      s.Hub,
-		Store:    s.Store,
-		RoomID:   roomID,
-		UserID:   userID,
-		Username: claims.Username,
-		Send:     make(chan ws.OutgoingMessage, 64),
+		Conn:      conn,
+		Hub:       s.Hub,
+		Store:     s.Store,
+		RoomID:    roomID,
+		UserID:    userID,
+		Username:  u.Username,
+		AvatarURL: u.AvatarURL,
+		Send:      make(chan ws.OutgoingMessage, 64),
 	}
 	s.Hub.Add(c)
 
@@ -78,7 +84,7 @@ func (s *Server) roomWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		participants := make([]ws.Participant, 0, len(members))
 		for _, m := range members {
-			participants = append(participants, ws.Participant{ID: m.ID.String(), Username: m.Username})
+			participants = append(participants, ws.Participant{ID: m.ID.String(), Username: m.Username, AvatarURL: m.AvatarURL})
 		}
 		s.Hub.Broadcast(roomID, ws.OutgoingMessage{Type: "participants", Participants: participants})
 	}
