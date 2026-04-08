@@ -1,4 +1,4 @@
-.PHONY: up down migrate backend frontend
+.PHONY: up down migrate backend frontend desktop
 
 up:
 	docker compose up --build
@@ -14,3 +14,6 @@ backend:
 
 frontend:
 	cd frontend && npm run dev
+
+desktop:
+	cd desktop && npm run dev

@@ -74,6 +74,13 @@ docker compose down
 3. Add Redis-backed pub/sub for multi-instance WebSocket fanout.
 4. Add database migrations tool (e.g. `golang-migrate`) and CI checks.
 
+## Windows Desktop App (Electron)
+If you need a real Windows app (`.exe` installer) instead of a browser tab, use the Electron wrapper in `/desktop`.
+
+- Dev (opens `http://localhost:5173`): see [`/Users/artemsharkov/Desktop/Talkie/desktop/README.md`](/Users/artemsharkov/Desktop/Talkie/desktop/README.md)
+- Release (Windows): `cd desktop && npm i && npm run dist:win`
+- By default, the packaged app opens `https://call.moderium-ai.ru` (override with `TALKIE_APP_URL`)
+
 ## Production VM (Docker Hub + Traefik)
 - Use [`docker-compose.prod.yml`](/Users/artemsharkov/Desktop/Talkie/docker-compose.prod.yml)
 - Env template: [`/Users/artemsharkov/Desktop/Talkie/.env.prod.example`](/Users/artemsharkov/Desktop/Talkie/.env.prod.example)
