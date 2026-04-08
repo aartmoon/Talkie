@@ -9,6 +9,11 @@ type AuthView = 'login' | 'register' | 'verify' | 'forgot' | 'reset';
 type CreateMode = 'server' | 'room';
 type MiniProfile = { id: string; username: string; avatarURL?: string; createdAt?: string; isFriend?: boolean; loading: boolean };
 type SidebarView = { kind: 'root' } | { kind: 'group'; groupID: string };
+const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+
+function hasGroupID(groupID?: string): groupID is string {
+  return Boolean(groupID && groupID !== NIL_UUID);
+}
 
 function flattenGroupChannels(groups: RoomGroup[]): AppRoom[] {
   const out: AppRoom[] = [];
@@ -265,6 +270,7 @@ export function App() {
   const roomWsReconnectRef = useRef<number | null>(null);
   const roomRef = useRef<Room | null>(null);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const groupsRef = useRef<RoomGroup[]>([]);
   const roomsRef = useRef<AppRoom[]>([]);
   const dmRoomsRef = useRef<AppRoom[]>([]);
   const callRoomIDRef = useRef<string | null>(null);
@@ -286,7 +292,7 @@ export function App() {
 
   const sortedRootRooms = useMemo(
     () =>
-      [...dmRooms, ...rooms.filter((room) => !room.group_id)]
+      [...dmRooms, ...rooms.filter((room) => !hasGroupID(room.group_id))]
         .slice()
         .sort(
           (a, b) => (roomActivityByID[b.id] || new Date(b.created_at).getTime()) - (roomActivityByID[a.id] || new Date(a.created_at).getTime()),
@@ -316,12 +322,12 @@ export function App() {
   }, [activeCallRoomID, rooms, dmRooms]);
   const selectedRoomResolved = useMemo(() => {
     if (!selectedRoom) return null;
-    const direct = [...rooms, ...dmRooms].find((room) => room.id === selectedRoom.id);
-    if (direct) return direct;
     for (const group of groups) {
       const channel = [...group.text_channels, ...group.voice_channels].find((room) => room.id === selectedRoom.id);
       if (channel) return toAppRoomFromGroupChannel(channel, group.id);
     }
+    const direct = [...rooms, ...dmRooms].find((room) => room.id === selectedRoom.id);
+    if (direct) return direct;
     return selectedRoom;
   }, [selectedRoom, rooms, dmRooms, groups]);
   const selectedRoomIsDM = useMemo(
@@ -332,10 +338,10 @@ export function App() {
     selectedRoomResolved && (selectedRoomResolved.can_manage || selectedRoomResolved.created_by === user?.id),
   );
   const selectedRoomChannelType = selectedRoomResolved?.channel_type || '';
-  const selectedRoomInGroup = Boolean(selectedRoomResolved?.group_id);
+  const selectedRoomInGroup = hasGroupID(selectedRoomResolved?.group_id);
   const selectedRoomIsTextOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'text');
-  const selectedRoomIsVoiceOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'voice');
-  const canUseCallUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsVoiceOnly || !selectedRoomChannelType));
+  // Keep calls available in any room to preserve legacy behavior after channel split.
+  const canUseCallUI = Boolean(selectedRoom);
   const canUseChatUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsTextOnly || !selectedRoomChannelType));
   const selectedSidebarGroup = useMemo(
     () => (sidebarView.kind === 'group' ? groups.find((group) => group.id === sidebarView.groupID) || null : null),
@@ -395,6 +401,10 @@ export function App() {
   useEffect(() => {
     selectedRoomIDRef.current = selectedRoom?.id || null;
   }, [selectedRoom?.id]);
+
+  useEffect(() => {
+    groupsRef.current = groups;
+  }, [groups]);
 
   useEffect(() => {
     roomsRef.current = rooms;
@@ -977,8 +987,8 @@ export function App() {
     if (!token) return;
     try {
       const [groupsResult, roomsResult] = await Promise.allSettled([api.listGroups(token), api.listRooms(token)]);
-      const nextGroups = groupsResult.status === 'fulfilled' ? groupsResult.value : groups;
-      const nextRooms = roomsResult.status === 'fulfilled' ? roomsResult.value : rooms;
+      const nextGroups = groupsResult.status === 'fulfilled' ? groupsResult.value : groupsRef.current;
+      const nextRooms = roomsResult.status === 'fulfilled' ? roomsResult.value : roomsRef.current;
       const flatRooms = mergeGroupedAndStandalone(nextGroups, nextRooms);
       setGroups(nextGroups);
       setRooms(flatRooms);
@@ -1001,11 +1011,13 @@ export function App() {
       if (prev.some((r) => r.id === room.id)) return prev;
       return [...prev, room];
     });
+    if (!roomsRef.current.some((r) => r.id === room.id)) {
+      roomsRef.current = [...roomsRef.current, room];
+    }
     setRoomActivityByID((prev) => ({
       ...prev,
       [room.id]: prev[room.id] || new Date(room.created_at).getTime(),
     }));
-    await refreshGroups();
     await openRoom(room);
   }
 
@@ -1035,7 +1047,7 @@ export function App() {
 
   async function openRoom(room: AppRoom) {
     if (!token) return;
-    if (room.group_id) {
+    if (hasGroupID(room.group_id)) {
       setSidebarView({ kind: 'group', groupID: room.group_id });
     } else {
       setSidebarView({ kind: 'root' });
@@ -1501,7 +1513,12 @@ export function App() {
       setShowMicSettings(false);
       setInCall(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'failed to connect call');
+      const message = err instanceof Error ? err.message : 'failed to connect call';
+      if (/could not establish pc connection/i.test(message)) {
+        setError('Не удалось установить WebRTC-соединение. На macOS проверьте доступ Talkie к микрофону и камере в System Settings -> Privacy & Security, затем попробуйте снова.');
+      } else {
+        setError(message);
+      }
     } finally {
       setConnectingMedia(false);
     }

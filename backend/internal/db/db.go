@@ -36,7 +36,7 @@ type Room struct {
 	AvatarURL   string    `json:"avatar_url,omitempty"`
 	IsPrivate   bool      `json:"is_private"`
 	ChannelType string  `json:"channel_type,omitempty"`
-	GroupID     uuid.UUID `json:"group_id,omitempty"`
+	GroupID     *uuid.UUID `json:"group_id,omitempty"`
 	Position    int       `json:"position,omitempty"`
 	MyRole      string    `json:"my_role,omitempty"`
 	CanManage   bool      `json:"can_manage,omitempty"`
@@ -203,7 +203,9 @@ func (s *Store) ListRoomsForUser(ctx context.Context, userID uuid.UUID) ([]Room,
 		FROM rooms r
 		JOIN room_members rm ON rm.room_id = r.id
 		LEFT JOIN direct_rooms d ON d.room_id = r.id
+		LEFT JOIN group_channels gc ON gc.room_id = r.id
 		WHERE d.room_id IS NULL
+		  AND gc.room_id IS NULL
 		  AND rm.user_id = $1
 		ORDER BY r.created_at DESC
 	`

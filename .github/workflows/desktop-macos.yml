@@ -1,0 +1,44 @@
+name: Desktop (macOS)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            script: dist:mac
+          - arch: x64
+            runner: macos-13
+            script: dist:mac:intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build DMG (${{ matrix.arch }})
+        working-directory: desktop
+        env:
+          TALKIE_APP_URL: https://call.moderium-ai.ru
+        run: npm run ${{ matrix.script }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: talkie-macos-dmg-${{ matrix.arch }}
+          path: |
+            desktop/dist/*.dmg
+            desktop/dist/*.dmg.blockmap

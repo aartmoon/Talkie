@@ -102,6 +102,21 @@ cp .env.prod.example .env.prod
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
 ```
 
+## GitHub Auto Deploy
+- Workflow: [`.github/workflows/deploy.yml`](/Users/artemsharkov/Desktop/Talkie/.github/workflows/deploy.yml)
+- Trigger: push to `main` (or manual `workflow_dispatch`)
+- Flow:
+1. Build backend/frontend Docker images.
+2. Push images to Docker Hub with tag `1.0.0` (or value from GitHub variable `DOCKER_IMAGE_TAG`).
+
+Required GitHub Secrets:
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+
+Optional GitHub Variables:
+- `DOCKERHUB_NAMESPACE` (default: `artshar`)
+- `DOCKER_IMAGE_TAG` (default: `1.0.0`)
+
 ```bash
 docker buildx build \
 --platform linux/amd64 \

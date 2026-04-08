@@ -7,6 +7,8 @@
     "start": "electron .",
     "dev": "cross-env TALKIE_APP_URL=http://localhost:5173 electron .",
     "dist:win": "electron-builder --win nsis --x64",
+    "dist:mac": "electron-builder --mac dmg --arm64",
+    "dist:mac:intel": "electron-builder --mac dmg --x64",
     "dist": "electron-builder"
   },
   "devDependencies": {
@@ -39,4 +41,3 @@
     }
   }
 }
-

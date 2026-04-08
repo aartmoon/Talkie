@@ -35,3 +35,5 @@ uploads/
 .cache/
 .tmp/
 
+desktop/dist/
+desktop/node_modules/
