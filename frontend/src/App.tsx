@@ -120,6 +120,29 @@ function previewText(message: Message): string {
   return text.length > 80 ? `${text.slice(0, 77)}...` : text;
 }
 
+function equalNumberMaps(a: Record<string, number>, b: Record<string, number>): boolean {
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if ((a[key] || 0) !== (b[key] || 0)) return false;
+  }
+  return true;
+}
+
+function equalFriendsData(a: FriendsResponse, b: FriendsResponse): boolean {
+  if (a.friends.length !== b.friends.length || a.incoming.length !== b.incoming.length) return false;
+  for (let i = 0; i < a.friends.length; i += 1) {
+    if (a.friends[i].id !== b.friends[i].id) return false;
+  }
+  for (let i = 0; i < a.incoming.length; i += 1) {
+    const left = a.incoming[i];
+    const right = b.incoming[i];
+    if (left.id !== right.id || left.status !== right.status) return false;
+  }
+  return true;
+}
+
 function VideoTile({
   item,
   muted,
@@ -166,6 +189,7 @@ export function App() {
   const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [acceptLegal, setAcceptLegal] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('talkie_token'));
   const [rooms, setRooms] = useState<AppRoom[]>([]);
@@ -212,7 +236,6 @@ export function App() {
   const [activeCallsByRoom, setActiveCallsByRoom] = useState<Record<string, number>>({});
   const [selectedRoom, setSelectedRoom] = useState<AppRoom | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [chatInput, setChatInput] = useState('');
   const [chatParticipants, setChatParticipants] = useState<Participant[]>([]);
   const [callParticipants, setCallParticipants] = useState<CallParticipant[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -247,6 +270,7 @@ export function App() {
   const callRoomIDRef = useRef<string | null>(null);
   const audioElsRef = useRef<Map<string, { participantID: string; source: Track.Source; el: HTMLAudioElement }>>(new Map());
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
   const micBeforeDeafenRef = useRef(false);
   const deafenedRef = useRef(false);
   const watchedVideoKeysRef = useRef<Record<string, boolean>>({});
@@ -260,12 +284,14 @@ export function App() {
   const lastRoomMessageIDsRef = useRef<Record<string, number>>({});
   const inviteJoinHandledRef = useRef(false);
 
-  const sortedDMRooms = useMemo(
+  const sortedRootRooms = useMemo(
     () =>
-      [...dmRooms].sort(
-        (a, b) => (roomActivityByID[b.id] || new Date(b.created_at).getTime()) - (roomActivityByID[a.id] || new Date(a.created_at).getTime()),
-      ),
-    [dmRooms, roomActivityByID],
+      [...dmRooms, ...rooms.filter((room) => !room.group_id)]
+        .slice()
+        .sort(
+          (a, b) => (roomActivityByID[b.id] || new Date(b.created_at).getTime()) - (roomActivityByID[a.id] || new Date(a.created_at).getTime()),
+        ),
+    [dmRooms, rooms, roomActivityByID],
   );
   const hasUnreadGroupChats = useMemo(
     () => rooms.some((room) => (unreadByRoom[room.id] || 0) > 0),
@@ -288,13 +314,25 @@ export function App() {
     if (!activeCallRoomID) return null;
     return [...rooms, ...dmRooms].find((room) => room.id === activeCallRoomID) || null;
   }, [activeCallRoomID, rooms, dmRooms]);
+  const selectedRoomResolved = useMemo(() => {
+    if (!selectedRoom) return null;
+    const direct = [...rooms, ...dmRooms].find((room) => room.id === selectedRoom.id);
+    if (direct) return direct;
+    for (const group of groups) {
+      const channel = [...group.text_channels, ...group.voice_channels].find((room) => room.id === selectedRoom.id);
+      if (channel) return toAppRoomFromGroupChannel(channel, group.id);
+    }
+    return selectedRoom;
+  }, [selectedRoom, rooms, dmRooms, groups]);
   const selectedRoomIsDM = useMemo(
-    () => Boolean(selectedRoom && dmRooms.some((room) => room.id === selectedRoom.id)),
-    [selectedRoom, dmRooms],
+    () => Boolean(selectedRoomResolved && dmRooms.some((room) => room.id === selectedRoomResolved.id)),
+    [selectedRoomResolved, dmRooms],
   );
-  const selectedRoomCanManage = Boolean(selectedRoom?.can_manage);
-  const selectedRoomChannelType = selectedRoom?.channel_type || '';
-  const selectedRoomInGroup = Boolean(selectedRoom?.group_id);
+  const selectedRoomCanManage = Boolean(
+    selectedRoomResolved && (selectedRoomResolved.can_manage || selectedRoomResolved.created_by === user?.id),
+  );
+  const selectedRoomChannelType = selectedRoomResolved?.channel_type || '';
+  const selectedRoomInGroup = Boolean(selectedRoomResolved?.group_id);
   const selectedRoomIsTextOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'text');
   const selectedRoomIsVoiceOnly = Boolean(selectedRoom && !selectedRoomIsDM && selectedRoomChannelType === 'voice');
   const canUseCallUI = Boolean(selectedRoom && (selectedRoomIsDM || selectedRoomIsVoiceOnly || !selectedRoomChannelType));
@@ -302,6 +340,9 @@ export function App() {
   const selectedSidebarGroup = useMemo(
     () => (sidebarView.kind === 'group' ? groups.find((group) => group.id === sidebarView.groupID) || null : null),
     [sidebarView, groups],
+  );
+  const selectedSidebarGroupCanManage = Boolean(
+    selectedSidebarGroup && (selectedSidebarGroup.can_manage || selectedSidebarGroup.created_by === user?.id),
   );
   const showRightInviteLinkButton = Boolean(!selectedRoomIsDM && !selectedSidebarGroup && !selectedRoomInGroup);
   const showRightInvitePanel = Boolean(!selectedRoomIsDM && !selectedSidebarGroup && !selectedRoomInGroup);
@@ -586,7 +627,11 @@ export function App() {
         const latest = await api.listMessages(token, roomID, 1);
         if (!mounted || latest.length === 0) return;
         const message = latest[0];
-        setLastMessagePreviewByRoom((prev) => ({ ...prev, [roomID]: previewText(message) }));
+        setLastMessagePreviewByRoom((prev) => {
+          const nextPreview = previewText(message);
+          if (prev[roomID] === nextPreview) return prev;
+          return { ...prev, [roomID]: nextPreview };
+        });
 
         setRoomActivityByID((prev) => {
           const ts = new Date(message.created_at).getTime();
@@ -647,7 +692,7 @@ export function App() {
       for (const [roomID, count] of statuses) {
         next[roomID] = count;
       }
-      setActiveCallsByRoom(next);
+      setActiveCallsByRoom((prev) => (equalNumberMaps(prev, next) ? prev : next));
     };
     void pollCalls();
     const id = window.setInterval(() => void pollCalls(), 8000);
@@ -671,14 +716,21 @@ export function App() {
           return latest;
         });
         if (latest.length > 0) {
-          setLastMessagePreviewByRoom((prev) => ({ ...prev, [selectedRoom.id]: previewText(latest[latest.length - 1]) }));
+          setLastMessagePreviewByRoom((prev) => {
+            const nextPreview = previewText(latest[latest.length - 1]);
+            if (prev[selectedRoom.id] === nextPreview) return prev;
+            return { ...prev, [selectedRoom.id]: nextPreview };
+          });
           lastRoomMessageIDsRef.current[selectedRoom.id] = latest[latest.length - 1].id;
         }
         if (!inCall || callRoomIDRef.current !== selectedRoom.id) {
           try {
             const callUsers = await api.listCallParticipants(token, selectedRoom.id);
             if (!mounted) return;
-            setActiveCallsByRoom((prev) => ({ ...prev, [selectedRoom.id]: callUsers.length }));
+            setActiveCallsByRoom((prev) => {
+              if ((prev[selectedRoom.id] || 0) === callUsers.length) return prev;
+              return { ...prev, [selectedRoom.id]: callUsers.length };
+            });
             applyCallPresence(callUsers);
           } catch {
             // best effort
@@ -706,7 +758,7 @@ export function App() {
       try {
         const social = await api.listFriends(token);
         if (!mounted) return;
-        setFriendsData(social);
+        setFriendsData((prev) => (equalFriendsData(prev, social) ? prev : social));
         if (friendsInitRef.current && social.incoming.length > incomingRequestsRef.current) {
           playNotifyTone('request');
           setHasNewFriendRequest(true);
@@ -808,10 +860,15 @@ export function App() {
     setAuthMessage(null);
     try {
       if (authView === 'register') {
+        if (!acceptLegal) {
+          setError('Подтвердите согласие с Пользовательским соглашением и Политикой конфиденциальности.');
+          return;
+        }
         await api.register(email, username, password);
         setPendingVerificationEmail(email.trim().toLowerCase());
         setVerificationTokenInput('');
         setPassword('');
+        setAcceptLegal(false);
         setAuthView('verify');
         setAuthMessage('Код подтверждения отправлен на email.');
         return;
@@ -948,9 +1005,11 @@ export function App() {
     try {
       if (createMode === 'room') {
         await createStandaloneRoom(newEntityName.trim());
+        setSidebarView({ kind: 'root' });
       } else {
         const group = await api.createGroup(token, newEntityName.trim());
         await refreshGroups();
+        setSidebarView({ kind: 'group', groupID: group.id });
         const firstText = group.text_channels[0];
         if (firstText) {
           const room = toAppRoomFromGroupChannel(firstText, group.id);
@@ -959,7 +1018,6 @@ export function App() {
       }
       setNewEntityName('');
       setShowCreateGroupModal(false);
-      setSidebarView({ kind: 'root' });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create entity');
     }
@@ -978,6 +1036,7 @@ export function App() {
     setChatParticipants([]);
     setCallParticipants([]);
     setPendingImage(null);
+    if (chatInputRef.current) chatInputRef.current.value = '';
     setFocusedTileKey(null);
     setUnreadByRoom((prev) => ({ ...prev, [room.id]: 0 }));
     callPresenceIDsRef.current = new Set();
@@ -1119,10 +1178,10 @@ export function App() {
       void sendImageMessage(e);
       return;
     }
-    const text = chatInput.trim();
+    const text = (chatInputRef.current?.value || '').trim();
     if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
     wsRef.current.send(JSON.stringify({ type: 'chat', content: text }));
-    setChatInput('');
+    if (chatInputRef.current) chatInputRef.current.value = '';
   }
 
   function syncCallParticipants(room: Room) {
@@ -1585,9 +1644,10 @@ export function App() {
     e.preventDefault();
     if (!token || !selectedRoom || !pendingImage) return;
     try {
-      await api.uploadRoomImage(token, selectedRoom.id, pendingImage, chatInput);
+      const caption = (chatInputRef.current?.value || '').trim();
+      await api.uploadRoomImage(token, selectedRoom.id, pendingImage, caption);
       setPendingImage(null);
-      setChatInput('');
+      if (chatInputRef.current) chatInputRef.current.value = '';
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to upload image');
     }
@@ -1732,8 +1792,7 @@ export function App() {
       if (copied) {
         setCopyNotice('Ссылка-приглашение в беседу скопирована.');
       } else {
-        window.prompt('Скопируйте ссылку вручную:', result.invite_url);
-        setCopyNotice('Ссылка создана. Скопируйте ее вручную.');
+        setCopyNotice(`Ссылка создана: ${result.invite_url}`);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create invite link');
@@ -1757,7 +1816,7 @@ export function App() {
       if (copied) {
         setCopyNotice('Ссылка на канал скопирована');
       } else {
-        window.prompt('Скопируйте ссылку вручную:', result.invite_url);
+        setCopyNotice(`Ссылка создана: ${result.invite_url}`);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create channel invite link');
@@ -1776,8 +1835,7 @@ export function App() {
       if (copied) {
         setCopyNotice('Ссылка для добавления в друзья скопирована.');
       } else {
-        window.prompt('Скопируйте ссылку вручную:', result.invite_url);
-        setCopyNotice('Ссылка создана. Скопируйте ее вручную.');
+        setCopyNotice(`Ссылка создана: ${result.invite_url}`);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed to create friend invite link');
@@ -2060,6 +2118,26 @@ export function App() {
               Password
               <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
             </label>
+            {authView === 'register' && (
+              <label className="auth-consent">
+                <input
+                  type="checkbox"
+                  checked={acceptLegal}
+                  onChange={(e) => setAcceptLegal(e.target.checked)}
+                  required
+                />
+                <span>
+                  Я ознакомлен и согласен с{' '}
+                  <a href="/legal/terms.html" target="_blank" rel="noreferrer">
+                    Пользовательским соглашением
+                  </a>{' '}
+                  и даю согласие на обработку моих персональных данных в соответствии с{' '}
+                  <a href="/legal/privacy.html" target="_blank" rel="noreferrer">
+                    Политикой конфиденциальности
+                  </a>.
+                </span>
+              </label>
+            )}
             {hasInviteInURL && <small>После входа вы автоматически присоединитесь по invite-ссылке.</small>}
             {hasFriendInviteInURL && <small>После входа вы автоматически добавите пользователя в друзья.</small>}
             <button type="submit">{authView === 'login' ? 'Войти' : 'Создать аккаунт'}</button>
@@ -2073,7 +2151,14 @@ export function App() {
                 </button>
               </>
             ) : (
-              <button type="button" className="ghost" onClick={() => setAuthView('login')}>
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => {
+                  setAcceptLegal(false);
+                  setAuthView('login');
+                }}
+              >
                 Уже есть аккаунт? Войти
               </button>
             )}
@@ -2117,7 +2202,7 @@ export function App() {
                     className={`server-rail-home ${sidebarView.kind === 'root' ? 'active' : ''}`}
                     onClick={() => setSidebarView({ kind: 'root' })}
                   >
-                    ЛС
+                    Talkie
                     {(hasUnreadDMs || hasUnreadGroupChats) && <span className="red-dot" />}
                   </button>
                   <ul className="server-rail-list">
@@ -2144,7 +2229,10 @@ export function App() {
                   {sidebarView.kind === 'root' ? (
                     <>
                       <div className="group-head">
-                        <strong>Личные сообщения</strong>
+                        <strong>
+                          <UserAvatar username="Talkie" size="sm" />
+                          Talkie
+                        </strong>
                       </div>
                       {inCall && activeCallRoom && (
                         <ul className="room-list">
@@ -2171,9 +2259,9 @@ export function App() {
                           </li>
                         </ul>
                       )}
-                      <small className="group-subtitle">Личные сообщения</small>
+                      <small className="group-subtitle">Диалоги и группы</small>
                       <ul className="room-list">
-                        {sortedDMRooms.map((room) => (
+                        {sortedRootRooms.map((room) => (
                           <li key={room.id}>
                             <button className={selectedRoom?.id === room.id ? 'active' : ''} onClick={() => openRoom(room)}>
                               <UserAvatar username={room.name} avatarUrl={resolveAvatarUrl(room.avatar_url)} size="sm" />
@@ -2191,7 +2279,7 @@ export function App() {
                     <>
                       <div className="group-head">
                         <strong>{selectedSidebarGroup?.name || 'Каналы'}</strong>
-                        {selectedSidebarGroup && selectedSidebarGroup.can_manage && (
+                        {selectedSidebarGroup && selectedSidebarGroupCanManage && (
                           <div className="group-actions">
                             <button type="button" className="ghost" onClick={() => renameGroupPrompt(selectedSidebarGroup.id, selectedSidebarGroup.name)}>
                               Переименовать
@@ -2540,8 +2628,7 @@ export function App() {
                       />
                     </label>
                     <input
-                      value={chatInput}
-                      onChange={(e) => setChatInput(e.target.value)}
+                      ref={chatInputRef}
                       onPaste={handleChatPaste}
                       placeholder={pendingImage ? 'Подпись к изображению (необязательно)' : 'Напишите сообщение'}
                     />

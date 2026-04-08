@@ -65,6 +65,34 @@ label {
   font-size: 14px;
 }
 
+.auth-consent {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.45;
+  color: var(--text-1);
+}
+
+.auth-consent input[type='checkbox'] {
+  margin-top: 2px;
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  padding: 0;
+  border-radius: 4px;
+  accent-color: var(--accent);
+}
+
+.auth-consent a {
+  color: #9fc0ff;
+}
+
+.auth-consent a:hover {
+  color: #c6d9ff;
+}
+
 input {
   border: 1px solid var(--border);
   border-radius: 10px;

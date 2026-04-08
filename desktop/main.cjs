@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, Menu, shell } = require('electron');
 const path = require('path');
 
 function getAppUrl() {
@@ -13,6 +13,7 @@ function createWindow() {
     height: 800,
     minWidth: 960,
     minHeight: 640,
+    autoHideMenuBar: true,
     backgroundColor: '#0b0f1a',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -54,6 +55,8 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(() => {
+    Menu.setApplicationMenu(null);
+
     if (process.platform === 'win32') {
       app.setAppUserModelId('Talkie');
     }
